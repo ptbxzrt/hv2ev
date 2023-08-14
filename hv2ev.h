@@ -5,6 +5,7 @@
 #include "hv/hbuf.h"
 #include "hv/hexport.h"
 #include "hv/hloop.h"
+#include "hv/hsocket.h"
 
 #define EV_READ HV_READ
 #define EV_WRITE HV_WRITE
@@ -81,9 +82,11 @@ HV_INLINE struct event_base *event_base_new(void) {
 HV_INLINE void event_base_free(struct event_base *base) {
   if (base->timer != NULL) {
     htimer_del(base->timer);
+    base->timer = NULL;
   }
   if (base->loop != NULL) {
     hloop_free(&(base->loop));
+    base->loop = NULL;
   }
   HV_FREE(base);
 }
@@ -135,20 +138,22 @@ HV_INLINE void on_readable(hio_t *io) {
   struct event *ev = (struct event *)hevent_userdata(io);
   int fd = hio_fd(io);
   short events = ev->events;
+
+  if (!(events & EV_PERSIST)) {
+    hio_del(io, EV_READ);
+    if (ev->timer != NULL) {
+      htimer_del(ev->timer);
+    }
+  }
+
   event_callback_fn callback = ev->callback;
   void *callback_arg = ev->callback_arg;
   if (callback) {
     callback(fd, EV_READ, callback_arg);
   }
-  if (!(events & EV_PERSIST)) {
-    hio_del(io, EV_READ);
-  }
 
-  if (ev->timer != NULL) {
+  if ((ev->timer != NULL) && (events & EV_PERSIST)) {
     htimer_reset(ev->timer, ev->timeout);
-  }
-  if (ev->base->timer != NULL) {
-    htimer_reset(ev->base->timer, ev->base->timeout);
   }
 }
 
@@ -156,20 +161,22 @@ HV_INLINE void on_writable(hio_t *io) {
   struct event *ev = (struct event *)hevent_userdata(io);
   int fd = hio_fd(io);
   short events = ev->events;
+
+  if (!(events & EV_PERSIST)) {
+    hio_del(io, EV_WRITE);
+    if (ev->timer != NULL) {
+      htimer_del(ev->timer);
+    }
+  }
+
   event_callback_fn callback = ev->callback;
   void *callback_arg = ev->callback_arg;
   if (callback) {
     callback(fd, EV_WRITE, callback_arg);
   }
-  if (!(events & EV_PERSIST)) {
-    hio_del(io, EV_WRITE);
-  }
 
-  if (ev->timer != NULL) {
+  if ((ev->timer != NULL) && (events & EV_PERSIST)) {
     htimer_reset(ev->timer, ev->timeout);
-  }
-  if (ev->base->timer != NULL) {
-    htimer_reset(ev->base->timer, ev->base->timeout);
   }
 }
 
@@ -178,34 +185,36 @@ int event_del(struct event *ev);
 HV_INLINE void on_timeout(htimer_t *timer) {
   struct event *ev = (struct event *)hevent_userdata(timer);
   short events = ev->events;
+
+  if (!(events & EV_PERSIST)) {
+    event_del(ev);
+    if (ev->timer != NULL) {
+      htimer_del(ev->timer);
+    }
+  }
+
   event_callback_fn callback = ev->callback;
   void *callback_arg = ev->callback_arg;
   if (callback) {
     callback(ev->fd, EV_TIMEOUT, callback_arg);
   }
-  if (!(events & EV_PERSIST)) {
-    event_del(ev);
-  }
 
-  if (ev->timer != NULL) {
+  if ((ev->timer != NULL) && (events & EV_PERSIST)) {
     htimer_reset(ev->timer, ev->timeout);
-  }
-  if (ev->base->timer != NULL) {
-    htimer_reset(ev->base->timer, ev->base->timeout);
   }
 }
 
 HV_INLINE void on_active(hevent_t *hev) {
   struct event *ev = (struct event *)hevent_userdata(hev);
-  int active_events = *((int *)hev->privdata);
+  int active_events = (intptr_t)hev->privdata;
   event_callback_fn callback = ev->callback;
   void *callback_arg = ev->callback_arg;
   if (callback) {
     callback(ev->fd, active_events, callback_arg);
   }
 
-  if (ev->base->timer != NULL) {
-    htimer_reset(ev->base->timer, ev->base->timeout);
+  if (ev->timer != NULL) {
+    htimer_reset(ev->timer, ev->timeout);
   }
 }
 
@@ -292,8 +301,21 @@ HV_INLINE void event_free(struct event *ev) {
   event_del(ev);
   if (ev->io != NULL) {
     hio_close(ev->io);
+    ev->io = NULL;
   }
   HV_FREE(ev);
 }
+
+#define evutil_make_socket_nonblocking(s) nonblocking((s))
+#define evutil_closesocket(s) SAFE_CLOSESOCKET((s))
+#define evutil_socketpair(family, type, protocol, pair)                        \
+  Socketpair((family), (type), (protocol), (pair))
+#define EVUTIL_SHUT_WR SHUT_WR
+#define EVUTIL_SHUT_RD SHUT_RD
+#define evutil_gettimeofday(tv, tz) gettimeofday((tv), (tz))
+#define evtimer_add(ev, tv) event_add((ev), (tv))
+#define evtimer_del(ev) event_del(ev)
+#define evtimer_new(b, cb, arg) event_new((b), -1, 0, (cb), (arg))
+#define evutil_timerclear(tvp) timerclear(tvp)
 
 #endif
