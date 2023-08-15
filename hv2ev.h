@@ -16,7 +16,7 @@ typedef int evutil_socket_t;
 typedef void (*event_callback_fn)(evutil_socket_t fd, short events,
                                   void *callback_arg);
 
-typedef struct event {
+struct event {
   struct event_base *base;
 
   hio_t *io;
@@ -28,29 +28,35 @@ typedef struct event {
 
   htimer_t *timer;
   int timeout;
-} event;
+};
 
-typedef struct event_base {
+struct event_base {
   hloop_t *loop;
   htimer_t *timer;
   int timeout;
-} event_base;
+};
 
-typedef struct evbuffer_chain {
+struct evbuffer_chain {
   hbuf_t buf;
+  size_t misalign;
+  size_t off;
   evbuffer_chain *next;
-} evbuffer_chain;
+};
 
-typedef struct evbuffer {
-  evbuffer_chain *first;
-  evbuffer_chain *last;
+struct evbuffer {
+  struct evbuffer_chain *first;
+  struct evbuffer_chain *last;
+  struct evbuffer_chain *last_with_datap;
   size_t total_len;
-} evbuffer;
+};
 
 struct evbuffer *evbuffer_new(void) {
   struct evbuffer *buffer = NULL;
   HV_ALLOC(buffer, sizeof(struct evbuffer));
   buffer->total_len = 0;
+  buffer->first = NULL;
+  buffer->last = NULL;
+  buffer->last_with_datap = buffer->first;
   return buffer;
 }
 
@@ -60,15 +66,239 @@ void evbuffer_free(struct evbuffer *buffer) {
   }
   struct evbuffer_chain *p = buffer->first;
   while (p != NULL) {
+    struct evbuffer_chain *next = p->next;
     HV_FREE(p->buf.base);
     HV_FREE(p);
-    p = p->next;
+    p = next;
   }
   HV_FREE(buffer);
 }
 
 size_t evbuffer_get_length(const struct evbuffer *buffer) {
   return buffer->total_len;
+}
+
+struct evbuffer_chain *evbuffer_chain_new(size_t size) {
+  size_t to_alloc = 1024;
+  while (to_alloc < size) {
+    to_alloc <<= 1;
+  }
+  to_alloc <<= 1;
+  struct evbuffer_chain *chain = NULL;
+  HV_ALLOC(chain, sizeof(struct evbuffer_chain));
+  HV_ALLOC(chain->buf.base, to_alloc);
+  chain->buf.len = to_alloc;
+  chain->misalign = 0;
+  chain->off = 0;
+  chain->next = NULL;
+  return chain;
+}
+
+void evbuffer_chain_free(struct evbuffer_chain *chain) {
+  HV_FREE(chain->buf.base);
+  HV_FREE(chain);
+}
+
+void evbuffer_chain_insert(struct evbuffer *buf, struct evbuffer_chain *chain) {
+  if (buf->last == NULL) {
+    buf->first = chain;
+    buf->last = chain;
+  } else {
+    buf->last->next = chain;
+    buf->last = chain;
+  }
+}
+
+int evbuffer_add(struct evbuffer *buf, const void *data_in, size_t datalen) {
+  struct evbuffer_chain *chain = buf->last_with_datap;
+
+  if (chain == NULL) {
+    chain = evbuffer_chain_new(datalen);
+    if (chain == NULL) {
+      return -1;
+    }
+    evbuffer_chain_insert(buf, chain);
+    memcpy(chain->buf.base + chain->misalign + chain->off, data_in, datalen);
+    chain->off += datalen;
+    buf->last_with_datap = chain;
+  } else {
+    size_t free_space = chain->buf.len - chain->misalign - chain->off;
+    if (free_space >= datalen) {
+      memcpy(chain->buf.base + chain->misalign + chain->off, data_in, datalen);
+      chain->off += datalen;
+    } else {
+      size_t left_datalen = datalen - free_space;
+      char *left_data = (char *)data_in + free_space;
+      struct evbuffer_chain *new_chain = evbuffer_chain_new(left_datalen);
+      if (new_chain == NULL) {
+        return -1;
+      }
+      memcpy(chain->buf.base + chain->misalign + chain->off, data_in,
+             free_space);
+      chain->off += free_space;
+      evbuffer_chain_insert(buf, new_chain);
+      memcpy(new_chain->buf.base + new_chain->misalign + new_chain->off,
+             left_data, left_datalen);
+      new_chain->off += left_datalen;
+      buf->last_with_datap = new_chain;
+    }
+  }
+  buf->total_len += datalen;
+  return 0;
+}
+
+int evbuffer_expand(struct evbuffer *buf, size_t datalen) {
+  struct evbuffer_chain *chain = buf->last_with_datap;
+
+  if (chain == NULL) {
+    chain = evbuffer_chain_new(datalen);
+    if (chain == NULL) {
+      return -1;
+    }
+    evbuffer_chain_insert(buf, chain);
+    // 注意：如果有chain，但没有数据，last_with_datap也应该指向first
+    buf->last_with_datap = chain;
+  } else {
+    int total_free_space = 0;
+    struct evbuffer_chain *p = chain;
+    while (p != NULL) {
+      total_free_space += (p->buf.len - p->misalign - p->off);
+      p = p->next;
+    }
+    if (total_free_space < datalen) {
+      struct evbuffer_chain *new_chain =
+          evbuffer_chain_new(datalen - total_free_space);
+      if (new_chain == NULL) {
+        return -1;
+      }
+      evbuffer_chain_insert(buf, new_chain);
+    }
+  }
+  return 0;
+}
+
+int evbuffer_prepend(struct evbuffer *buf, const void *data, size_t datalen) {
+  struct evbuffer_chain *chain = buf->first;
+
+  if (chain == NULL) {
+    chain = evbuffer_chain_new(datalen);
+    if (chain == NULL) {
+      return -1;
+    }
+    evbuffer_chain_insert(buf, chain);
+    // 注意：如果有chain，但没有数据，last_with_datap也应该指向first
+    buf->last_with_datap = chain;
+  }
+
+  if (chain->off == 0) {
+    chain->misalign = chain->buf.len;
+  }
+  if (chain->misalign >= datalen) {
+    memcpy(chain->buf.base + chain->misalign - datalen, data, datalen);
+    chain->misalign -= datalen;
+    chain->off += datalen;
+  } else {
+    size_t free_space = chain->misalign;
+    memcpy(chain->buf.base, (char *)data + datalen - free_space, free_space);
+    chain->misalign -= free_space;
+    chain->off += free_space;
+
+    size_t left_datalen = datalen - free_space;
+    struct evbuffer_chain *new_chain = evbuffer_chain_new(left_datalen);
+    if (new_chain == NULL) {
+      return -1;
+    }
+    buf->first = new_chain;
+    new_chain->next = chain;
+    new_chain->misalign = new_chain->buf.len - left_datalen;
+    new_chain->off = left_datalen;
+    memcpy(new_chain->buf.base + new_chain->misalign, data, left_datalen);
+  }
+  buf->total_len += datalen;
+  return 0;
+}
+
+int evbuffer_drain(struct evbuffer *buf, size_t len) {
+  int buf_data_len = buf->total_len;
+  struct evbuffer_chain *chain, *next;
+  if (buf_data_len <= len) {
+    for (chain = buf->first; chain != NULL; chain = next) {
+      next = chain->next;
+      evbuffer_chain_free(chain);
+    }
+    buf->total_len = 0;
+    buf->first = NULL;
+    buf->last = NULL;
+    buf->last_with_datap = buf->first;
+  } else {
+    buf->total_len -= len;
+    size_t remain_to_delete = len;
+    for (chain = buf->first; remain_to_delete >= chain->off; chain = next) {
+      next = chain->next;
+      remain_to_delete -= chain->off;
+      evbuffer_chain_free(chain);
+    }
+    buf->first = chain;
+    chain->misalign += remain_to_delete;
+    chain->off -= remain_to_delete;
+  }
+  return 0;
+}
+
+int evbuffer_add_printf(struct evbuffer *buf, const char *fmt, ...) {
+  char str[1024];
+
+  va_list args;
+  va_start(args, fmt);
+  sprintf(str, fmt, args);
+  va_end(args);
+
+  evbuffer_add(buf, str, strlen(str));
+  return 0;
+}
+
+int evbuffer_add_buffer(struct evbuffer *dst, struct evbuffer *src) {
+  if (dst == src || src->total_len == 0) {
+    return 0;
+  }
+  struct evbuffer_chain *dst_last_datap = dst->last_with_datap;
+  struct evbuffer_chain *src_last_datap = src->last_with_datap;
+
+  struct evbuffer_chain *dst_first_no_datap = dst_last_datap->next;
+  struct evbuffer_chain *src_first_no_datap = src_last_datap->next;
+
+  dst_last_datap->next = src->first;
+  src_last_datap->next = dst_first_no_datap;
+  dst->last_with_datap = src_last_datap;
+
+  src->first = src_first_no_datap;
+  src->last_with_datap = src_first_no_datap;
+
+  dst->total_len += src->total_len;
+  src->total_len = 0;
+  return 0;
+}
+
+#define evbuffer_iovec iovec
+
+size_t evbuffer_add_iovec(struct evbuffer *buf, struct evbuffer_iovec *vec,
+                          int n_vec) {
+  int n;
+  size_t res = 0;
+  size_t to_alloc = 0;
+  for (n = 0; n < n_vec; n++) {
+    to_alloc += vec[n].iov_len;
+  }
+  evbuffer_expand(buf, to_alloc);
+  for (n = 0; n < n_vec; n++) {
+
+    if (evbuffer_add(buf, vec[n].iov_base, vec[n].iov_len) < 0) {
+      return res;
+    }
+
+    res += vec[n].iov_len;
+  }
+  return res;
 }
 
 HV_INLINE struct event_base *event_base_new(void) {
