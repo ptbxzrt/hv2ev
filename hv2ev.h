@@ -422,6 +422,27 @@ int evbuffer_add_reference(struct evbuffer *buf, const void *data,
   return 0;
 }
 
+int evutil_make_socket_closeonexec(evutil_socket_t fd) {
+  int flags;
+  if ((flags = fcntl(fd, F_GETFD, NULL)) < 0) {
+    return -1;
+  }
+  if (!(flags & FD_CLOEXEC)) {
+    if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == -1) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+int evutil_inet_pton(int af, const char *src, void *dst) {
+  return inet_pton(af, src, dst);
+}
+
+const char *evutil_inet_ntop(int af, const void *src, char *dst, size_t len) {
+  return inet_ntop(af, src, dst, len);
+}
+
 HV_INLINE struct event_base *event_base_new(void) {
   struct event_base *base = NULL;
   HV_ALLOC(base, sizeof(struct event_base));
