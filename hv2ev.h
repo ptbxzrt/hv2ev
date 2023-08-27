@@ -53,7 +53,7 @@ struct evbuffer_chain {
 struct evbuffer {
   struct evbuffer_chain *first;
   struct evbuffer_chain *last;
-  struct evbuffer_chain *last_with_datap;
+  struct evbuffer_chain **last_with_datap;
   size_t total_len;
 };
 
@@ -63,7 +63,7 @@ struct evbuffer *evbuffer_new(void) {
   buffer->total_len = 0;
   buffer->first = NULL;
   buffer->last = NULL;
-  buffer->last_with_datap = buffer->first;
+  buffer->last_with_datap = &(buffer->first);
   return buffer;
 }
 
@@ -120,25 +120,29 @@ void evbuffer_chain_insert(struct evbuffer *buf, struct evbuffer_chain *chain) {
   if (buf->last == NULL) {
     buf->first = chain;
     buf->last = chain;
+    if (chain->off > 0) {
+      buf->last_with_datap = &(buf->first);
+    }
   } else {
     buf->last->next = chain;
+    if (chain->off > 0) {
+      buf->last_with_datap = &(buf->last->next);
+    }
     buf->last = chain;
   }
 }
 
 int evbuffer_add(struct evbuffer *buf, const void *data_in, size_t datalen) {
-  struct evbuffer_chain *chain = buf->last_with_datap;
+  struct evbuffer_chain *chain = *(buf->last_with_datap);
 
   if (chain == NULL) {
     chain = evbuffer_chain_new(datalen);
     if (chain == NULL) {
       return -1;
     }
-    evbuffer_chain_insert(buf, chain);
     memcpy(chain->buf.base + chain->misalign + chain->off, data_in, datalen);
     chain->off += datalen;
-    // 注意：如果有chain，但没有数据，last_with_datap也应该指向first
-    buf->last_with_datap = chain;
+    evbuffer_chain_insert(buf, chain);
   } else {
     size_t free_space = chain->buf.len - chain->misalign - chain->off;
     if (free_space >= datalen) {
@@ -154,11 +158,10 @@ int evbuffer_add(struct evbuffer *buf, const void *data_in, size_t datalen) {
       memcpy(chain->buf.base + chain->misalign + chain->off, data_in,
              free_space);
       chain->off += free_space;
-      evbuffer_chain_insert(buf, new_chain);
       memcpy(new_chain->buf.base + new_chain->misalign + new_chain->off,
              left_data, left_datalen);
       new_chain->off += left_datalen;
-      buf->last_with_datap = new_chain;
+      evbuffer_chain_insert(buf, new_chain);
     }
   }
   buf->total_len += datalen;
@@ -166,7 +169,7 @@ int evbuffer_add(struct evbuffer *buf, const void *data_in, size_t datalen) {
 }
 
 int evbuffer_expand(struct evbuffer *buf, size_t datalen) {
-  struct evbuffer_chain *chain = buf->last_with_datap;
+  struct evbuffer_chain *chain = *(buf->last_with_datap);
 
   if (chain == NULL) {
     chain = evbuffer_chain_new(datalen);
@@ -174,8 +177,6 @@ int evbuffer_expand(struct evbuffer *buf, size_t datalen) {
       return -1;
     }
     evbuffer_chain_insert(buf, chain);
-    // 注意：如果有chain，但没有数据，last_with_datap也应该指向first
-    buf->last_with_datap = chain;
   } else {
     int total_free_space = 0;
     struct evbuffer_chain *p = chain;
@@ -204,8 +205,6 @@ int evbuffer_prepend(struct evbuffer *buf, const void *data, size_t datalen) {
       return -1;
     }
     evbuffer_chain_insert(buf, chain);
-    // 注意：如果有chain，但没有数据，last_with_datap也应该指向first
-    buf->last_with_datap = chain;
   }
 
   if (chain->off == 0) {
@@ -247,13 +246,17 @@ int evbuffer_drain(struct evbuffer *buf, size_t len) {
     buf->total_len = 0;
     buf->first = NULL;
     buf->last = NULL;
-    buf->last_with_datap = buf->first;
+    buf->last_with_datap = &(buf->first);
   } else {
     buf->total_len -= len;
     size_t remain_to_delete = len;
     for (chain = buf->first; remain_to_delete >= chain->off; chain = next) {
       next = chain->next;
       remain_to_delete -= chain->off;
+      if ((chain == *(buf->last_with_datap)) ||
+          (&(chain->next) == buf->last_with_datap)) {
+        buf->last_with_datap = &(buf->first);
+      }
       evbuffer_chain_free(chain);
     }
     buf->first = chain;
@@ -376,12 +379,19 @@ unsigned char *evbuffer_pullup(struct evbuffer *buf, size_t size) {
     chain = first_chain;
   }
 
+  int removed_last_with_data = 0, removed_last_with_datap = 0;
   while (remaining_to_copy > 0 && chain != NULL &&
          chain->off <= remaining_to_copy) {
     struct evbuffer_chain *next = chain->next;
     memcpy(buffer, chain->buf.base + chain->misalign, chain->off);
     buffer += chain->off;
     remaining_to_copy -= chain->off;
+    if (chain == *(buf->last_with_datap)) {
+      removed_last_with_data = 1;
+    }
+    if (&(chain->next) == buf->last_with_datap) {
+      removed_last_with_datap = 1;
+    }
     evbuffer_chain_free(chain);
     chain = next;
   }
@@ -397,11 +407,17 @@ unsigned char *evbuffer_pullup(struct evbuffer *buf, size_t size) {
   if (chain == NULL) {
     buf->last = chain_contiguous;
   }
-  if (size == buf->total_len) {
-    buf->last_with_datap = chain_contiguous;
-  }
 
   chain_contiguous->next = chain;
+
+  if (removed_last_with_data) {
+    buf->last_with_datap = &(buf->first);
+  } else if (removed_last_with_datap) {
+    if (buf->first->next && buf->first->next->off)
+      buf->last_with_datap = &(buf->first->next);
+    else
+      buf->last_with_datap = &(buf->first);
+  }
 
   return (unsigned char *)(chain_contiguous->buf.base +
                            chain_contiguous->misalign);
