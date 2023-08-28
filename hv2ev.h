@@ -265,10 +265,11 @@ int evbuffer_drain(struct evbuffer *buf, size_t len) {
 
 int evbuffer_add_printf(struct evbuffer *buf, const char *fmt, ...) {
   char str[1024];
+  memset(str, 0, sizeof(str));
 
   va_list args;
   va_start(args, fmt);
-  sprintf(str, fmt, args);
+  vsprintf(str, fmt, args);
   va_end(args);
 
   evbuffer_add(buf, str, strlen(str));
@@ -304,15 +305,16 @@ int evbuffer_add_buffer(struct evbuffer *dst, struct evbuffer *src) {
     src_last->next = dst_first_no_datap;
     dst->last_with_datap = src->last_with_datap;
   }
+  dst->total_len += src->total_len;
 
   src->first = NULL;
   src->last = NULL;
   src->last_with_datap = NULL;
   src->total_len = 0;
-  dst->total_len += src->total_len;
 
   struct evbuffer_chain *chain = dst->last_with_datap->next, *next = NULL;
   dst->last_with_datap->next = NULL;
+  dst->last = dst->last_with_datap;
   while (chain != NULL) {
     next = chain->next;
     evbuffer_chain_free(chain);
@@ -344,11 +346,11 @@ size_t evbuffer_add_iovec(struct evbuffer *buf, struct evbuffer_iovec *vec,
   return res;
 }
 
-unsigned char *evbuffer_pullup(struct evbuffer *buf, size_t size) {
-  if (size == 0 || size > buf->total_len) {
-    return NULL;
-  } else if (size < 0) {
+unsigned char *evbuffer_pullup(struct evbuffer *buf, ssize_t size) {
+  if (size < 0) {
     size = buf->total_len;
+  } else if (size == 0 || size > buf->total_len) {
+    return NULL;
   }
 
   struct evbuffer_chain *first_chain = buf->first;
@@ -363,8 +365,9 @@ unsigned char *evbuffer_pullup(struct evbuffer *buf, size_t size) {
   if (first_chain->buf.len - first_chain->misalign >= remaining_to_copy) {
     chain_contiguous = first_chain;
     remaining_to_copy -= first_chain->off;
+    size_t old_off = first_chain->off;
     chain_contiguous->off = size;
-    buffer = first_chain->buf.base + first_chain->misalign + first_chain->off;
+    buffer = first_chain->buf.base + first_chain->misalign + old_off;
     chain = first_chain->next;
   } else {
     chain_contiguous = evbuffer_chain_new(remaining_to_copy);
