@@ -12,6 +12,30 @@
 #define EV_WRITE HV_WRITE
 #define EV_PERSIST 0x0010
 #define EV_TIMEOUT 0x0020
+#define evutil_make_socket_nonblocking(s) nonblocking((s))
+#define evutil_closesocket(s) SAFE_CLOSESOCKET((s))
+#define evutil_socketpair(family, type, protocol, pair)                        \
+  Socketpair((family), (type), (protocol), (pair))
+#define EVUTIL_SHUT_WR SHUT_WR
+#define EVUTIL_SHUT_RD SHUT_RD
+#define evutil_gettimeofday(tv, tz) gettimeofday((tv), (tz))
+#define evtimer_add(ev, tv) event_add((ev), (tv))
+#define evtimer_del(ev) event_del(ev)
+#define evtimer_new(b, cb, arg) event_new((b), -1, 0, (cb), (arg))
+#define evutil_timerclear(tvp) timerclear(tvp)
+#define evutil_socket_geterror(sock) (errno)
+#define EVUTIL_ERR_CONNECT_RETRIABLE(e) ((e) == EINTR || (e) == EINPROGRESS)
+#define EVUTIL_ERR_CONNECT_REFUSED(e) ((e) == ECONNREFUSED)
+#define EVUTIL_SET_SOCKET_ERROR(errcode)                                       \
+  do {                                                                         \
+    errno = (errcode);                                                         \
+  } while (0)
+#define BEV_EVENT_READING 0x01   /**< error encountered while reading */
+#define BEV_EVENT_WRITING 0x02   /**< error encountered while writing */
+#define BEV_EVENT_EOF 0x10       /**< eof file reached */
+#define BEV_EVENT_ERROR 0x20     /**< unrecoverable error encountered */
+#define BEV_EVENT_TIMEOUT 0x40   /**< user-specified timeout reached */
+#define BEV_EVENT_CONNECTED 0x80 /**< connect operation finished. */
 
 typedef int evutil_socket_t;
 typedef void (*event_callback_fn)(evutil_socket_t fd, short events,
@@ -440,6 +464,7 @@ struct bufferevent {
   struct event_base *ev_base;
   struct event ev_read;
   struct event ev_write;
+  struct event ev_err;
   struct evbuffer *input;
   struct evbuffer *output;
   bufferevent_data_cb readcb;
@@ -449,6 +474,8 @@ struct bufferevent {
   struct timeval timeout_read;
   struct timeval timeout_write;
   short enabled;
+  unsigned connecting;
+  unsigned connection_refused;
 };
 
 #define EVBUFFER_MAX_READ 4096
@@ -468,8 +495,49 @@ static void bufferevent_readcb(evutil_socket_t fd, short event, void *arg) {
   bufev->readcb(bufev, bufev->cbarg);
 }
 
+int evutil_socket_finished_connecting(evutil_socket_t fd) {
+  int e;
+  socklen_t elen = sizeof(e);
+
+  if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *)&e, &elen) < 0)
+    return -1;
+
+  if (e) {
+    if (EVUTIL_ERR_CONNECT_RETRIABLE(e))
+      return 0;
+    EVUTIL_SET_SOCKET_ERROR(e);
+    return -1;
+  }
+
+  return 1;
+}
+
 static void bufferevent_writecb(evutil_socket_t fd, short event, void *arg) {
   struct bufferevent *bufev = (struct bufferevent *)arg;
+
+  if (bufev->connecting) {
+    int c = evutil_socket_finished_connecting(fd);
+    if (bufev->connection_refused) {
+      bufev->connection_refused = 0;
+      c = -1;
+    }
+    if (c == 0)
+      return;
+    bufev->connecting = 0;
+    if (c < 0) {
+      event_del(&bufev->ev_write);
+      event_del(&bufev->ev_read);
+      bufev->errorcb(bufev, BEV_EVENT_ERROR, bufev->cbarg);
+      return;
+    } else {
+      // connected = 1;
+      bufev->errorcb(bufev, BEV_EVENT_CONNECTED, bufev->cbarg);
+      if (!(bufev->enabled & EV_WRITE)) {
+        event_del(&bufev->ev_write);
+        return;
+      }
+    }
+  }
 
   struct evbuffer *buffer = bufev->output;
   size_t n = buffer->total_len;
@@ -480,8 +548,13 @@ static void bufferevent_writecb(evutil_socket_t fd, short event, void *arg) {
   if (evbuffer_get_length(buffer) == 0) {
     bufev->writecb(bufev, bufev->cbarg);
     event_del(&(bufev->ev_write));
-    bufev->enabled &= (~EV_WRITE);
+    // bufev->enabled &= (~EV_WRITE);
   }
+}
+
+static void bufferevent_errcb(evutil_socket_t fd, short what, void *arg) {
+  struct bufferevent *bufev = (struct bufferevent *)arg;
+  bufev->errorcb(bufev, what, bufev->cbarg);
 }
 
 struct bufferevent *bufferevent_socket_new(struct event_base *base,
@@ -501,6 +574,8 @@ struct bufferevent *bufferevent_socket_new(struct event_base *base,
                bufferevent_readcb, bufev);
   event_assign(&(bufev->ev_write), bufev->ev_base, fd, EV_WRITE | EV_PERSIST,
                bufferevent_writecb, bufev);
+  event_assign(&(bufev->ev_err), bufev->ev_base, fd, 0, bufferevent_errcb,
+               bufev);
 
   bufev->readcb = NULL;
   bufev->writecb = NULL;
@@ -509,6 +584,8 @@ struct bufferevent *bufferevent_socket_new(struct event_base *base,
   timerclear(&(bufev->timeout_read));
   timerclear(&(bufev->timeout_write));
   bufev->enabled = 0;
+  bufev->connecting = 0;
+  bufev->connection_refused = 0;
 
   return bufev;
 }
@@ -526,7 +603,7 @@ void bufferevent_free(struct bufferevent *bufev) {
 int bufferevent_write_buffer(struct bufferevent *bufev, struct evbuffer *buf) {
   evbuffer_add_buffer(bufev->output, buf);
   event_add(&(bufev->ev_write), &(bufev->timeout_write));
-  bufev->enabled |= EV_WRITE;
+  // bufev->enabled |= EV_WRITE;
   return 0;
 }
 
@@ -629,6 +706,97 @@ int bufferevent_set_timeouts(struct bufferevent *bufev,
   r = adj_timeouts(bufev);
 
   return r;
+}
+
+int evutil_socket_connect(evutil_socket_t *fd_ptr, const struct sockaddr *sa,
+                          int socklen) {
+  int made_fd = 0;
+
+  if (*fd_ptr < 0) {
+    if ((*fd_ptr = socket(sa->sa_family, SOCK_STREAM, 0)) < 0)
+      goto err;
+    made_fd = 1;
+    if (evutil_make_socket_nonblocking(*fd_ptr) < 0) {
+      goto err;
+    }
+  }
+
+  if (connect(*fd_ptr, sa, socklen) < 0) {
+    int e = evutil_socket_geterror(*fd_ptr);
+    if (EVUTIL_ERR_CONNECT_RETRIABLE(e))
+      return 0;
+    if (EVUTIL_ERR_CONNECT_REFUSED(e))
+      return 2;
+    goto err;
+  } else {
+    return 1;
+  }
+
+err:
+  if (made_fd) {
+    evutil_closesocket(*fd_ptr);
+    *fd_ptr = -1;
+  }
+  return -1;
+}
+
+int bufferevent_socket_connect(struct bufferevent *bufev,
+                               const struct sockaddr *sa, int socklen) {
+  int result = -1, ownfd = 0, r;
+
+  evutil_socket_t fd = bufev->ev_read.fd;
+  if (fd < 0) {
+    if (!sa)
+      goto done;
+    fd = socket(sa->sa_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+      goto freesock;
+    ownfd = 1;
+  }
+
+  if (sa) {
+    r = evutil_socket_connect(&fd, sa, socklen);
+    if (r < 0)
+      goto freesock;
+  }
+
+  // bufferevent_setfd(bufev, fd);
+  {
+    event_del(&bufev->ev_read);
+    event_del(&bufev->ev_write);
+    event_assign(&bufev->ev_read, bufev->ev_base, fd, EV_READ | EV_PERSIST,
+                 bufferevent_readcb, bufev);
+    event_assign(&bufev->ev_write, bufev->ev_base, fd, EV_WRITE | EV_PERSIST,
+                 bufferevent_writecb, bufev);
+
+    if (fd >= 0)
+      bufferevent_enable(bufev, bufev->enabled);
+  }
+
+  if (r == 0) {
+    event_add(&bufev->ev_write, &bufev->timeout_write);
+    bufev->connecting = 1;
+    result = 0;
+    goto done;
+  } else if (r == 1) {
+    /* The connect succeeded already. */
+    result = 0;
+    bufev->connecting = 1;
+    event_active(&(bufev->ev_write), EV_WRITE, 1);
+  } else {
+    /* The connect failed already. */
+    result = 0;
+    event_active(&(bufev->ev_err), BEV_EVENT_ERROR, 1);
+    bufferevent_disable(bufev, EV_WRITE | EV_READ);
+  }
+  goto done;
+
+freesock:
+  if (ownfd)
+    evutil_closesocket(fd);
+
+done:
+  return result;
 }
 
 int evutil_make_socket_closeonexec(evutil_socket_t fd) {
@@ -890,17 +1058,5 @@ HV_INLINE void event_free(struct event *ev) {
   }
   HV_FREE(ev);
 }
-
-#define evutil_make_socket_nonblocking(s) nonblocking((s))
-#define evutil_closesocket(s) SAFE_CLOSESOCKET((s))
-#define evutil_socketpair(family, type, protocol, pair)                        \
-  Socketpair((family), (type), (protocol), (pair))
-#define EVUTIL_SHUT_WR SHUT_WR
-#define EVUTIL_SHUT_RD SHUT_RD
-#define evutil_gettimeofday(tv, tz) gettimeofday((tv), (tz))
-#define evtimer_add(ev, tv) event_add((ev), (tv))
-#define evtimer_del(ev) event_del(ev)
-#define evtimer_new(b, cb, arg) event_new((b), -1, 0, (cb), (arg))
-#define evutil_timerclear(tvp) timerclear(tvp)
 
 #endif
