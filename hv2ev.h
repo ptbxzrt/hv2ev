@@ -1,86 +1,28 @@
 #ifndef HV_2_EV_H_
 #define HV_2_EV_H_
 
-#include "hv/hbase.h"
-#include "hv/hbuf.h"
-#include "hv/hexport.h"
-#include "hv/hloop.h"
-#include "hv/hsocket.h"
-#include <sys/ioctl.h>
+#include "header.h"
 
-#define EV_READ HV_READ
-#define EV_WRITE HV_WRITE
-#define EV_PERSIST 0x0010
-#define EV_TIMEOUT 0x0020
-#define evutil_make_socket_nonblocking(s) nonblocking((s))
-#define evutil_closesocket(s) SAFE_CLOSESOCKET((s))
-#define evutil_socketpair(family, type, protocol, pair)                        \
-  Socketpair((family), (type), (protocol), (pair))
-#define EVUTIL_SHUT_WR SHUT_WR
-#define EVUTIL_SHUT_RD SHUT_RD
-#define evutil_gettimeofday(tv, tz) gettimeofday((tv), (tz))
-#define evtimer_add(ev, tv) event_add((ev), (tv))
-#define evtimer_del(ev) event_del(ev)
-#define evtimer_new(b, cb, arg) event_new((b), -1, 0, (cb), (arg))
-#define evutil_timerclear(tvp) timerclear(tvp)
-#define evutil_socket_geterror(sock) (errno)
-#define EVUTIL_ERR_CONNECT_RETRIABLE(e) ((e) == EINTR || (e) == EINPROGRESS)
-#define EVUTIL_ERR_CONNECT_REFUSED(e) ((e) == ECONNREFUSED)
-#define EVUTIL_SET_SOCKET_ERROR(errcode)                                       \
-  do {                                                                         \
-    errno = (errcode);                                                         \
-  } while (0)
-#define BEV_EVENT_READING 0x01   /**< error encountered while reading */
-#define BEV_EVENT_WRITING 0x02   /**< error encountered while writing */
-#define BEV_EVENT_EOF 0x10       /**< eof file reached */
-#define BEV_EVENT_ERROR 0x20     /**< unrecoverable error encountered */
-#define BEV_EVENT_TIMEOUT 0x40   /**< user-specified timeout reached */
-#define BEV_EVENT_CONNECTED 0x80 /**< connect operation finished. */
+int evutil_make_socket_closeonexec(evutil_socket_t fd) {
+  int flags;
+  if ((flags = fcntl(fd, F_GETFD, NULL)) < 0) {
+    return -1;
+  }
+  if (!(flags & FD_CLOEXEC)) {
+    if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == -1) {
+      return -1;
+    }
+  }
+  return 0;
+}
 
-typedef int evutil_socket_t;
-typedef void (*event_callback_fn)(evutil_socket_t fd, short events,
-                                  void *callback_arg);
+int evutil_inet_pton(int af, const char *src, void *dst) {
+  return inet_pton(af, src, dst);
+}
 
-struct event {
-  struct event_base *base;
-
-  hio_t *io;
-  int fd;
-  short events;
-
-  event_callback_fn callback;
-  void *callback_arg;
-
-  htimer_t *timer;
-  int timeout;
-};
-
-struct event_base {
-  hloop_t *loop;
-  htimer_t *timer;
-  int timeout;
-};
-
-#define EVBUFFER_REFERENCE 0x0004
-#define EVBUFFER_IMMUTABLE 0x0008
-typedef void (*evbuffer_ref_cleanup_cb)(const void *data, size_t datalen,
-                                        void *extra);
-struct evbuffer_chain {
-  hbuf_t buf;
-  size_t misalign;
-  size_t off;
-  evbuffer_chain *next;
-  unsigned flags;
-  evbuffer_ref_cleanup_cb cleanupfn;
-  void *args;
-};
-
-struct evbuffer {
-  struct evbuffer_chain *first;
-  struct evbuffer_chain *last;
-  struct evbuffer_chain *last_with_datap;
-  size_t total_len;
-};
+const char *evutil_inet_ntop(int af, const void *src, char *dst, size_t len) {
+  return inet_ntop(af, src, dst, len);
+}
 
 struct evbuffer *evbuffer_new(void) {
   struct evbuffer *buffer = NULL;
@@ -497,7 +439,7 @@ static void bufferevent_readcb(evutil_socket_t fd, short event, void *arg) {
 
 int evutil_socket_finished_connecting(evutil_socket_t fd) {
   int e;
-  socklen_t elen = sizeof(e);
+  ev_socklen_t elen = sizeof(e);
 
   if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *)&e, &elen) < 0)
     return -1;
@@ -514,6 +456,17 @@ int evutil_socket_finished_connecting(evutil_socket_t fd) {
 
 static void bufferevent_writecb(evutil_socket_t fd, short event, void *arg) {
   struct bufferevent *bufev = (struct bufferevent *)arg;
+  short what = BEV_EVENT_WRITING;
+
+  if (event == EV_TIMEOUT) {
+    /* Note that we only check for event==EV_TIMEOUT. If
+     * event==EV_TIMEOUT|EV_WRITE, we can safely ignore the
+     * timeout, since a read has occurred */
+    what |= BEV_EVENT_TIMEOUT;
+    bufferevent_disable(bufev, EV_WRITE);
+    bufev->errorcb(bufev, what, bufev->cbarg);
+    return;
+  }
 
   if (bufev->connecting) {
     int c = evutil_socket_finished_connecting(fd);
@@ -548,7 +501,6 @@ static void bufferevent_writecb(evutil_socket_t fd, short event, void *arg) {
   if (evbuffer_get_length(buffer) == 0) {
     bufev->writecb(bufev, bufev->cbarg);
     event_del(&(bufev->ev_write));
-    // bufev->enabled &= (~EV_WRITE);
   }
 }
 
@@ -799,25 +751,128 @@ done:
   return result;
 }
 
-int evutil_make_socket_closeonexec(evutil_socket_t fd) {
-  int flags;
-  if ((flags = fcntl(fd, F_GETFD, NULL)) < 0) {
+int bufferevent_socket_connect_hostname(struct bufferevent *bev,
+                                        struct evdns_base *evdns_base,
+                                        int family, const char *hostname,
+                                        int port) {
+  int ret = 0;
+  sockaddr_u addr;
+  memset(&addr, 0, sizeof(addr));
+  ret = sockaddr_set_ipport((sockaddr_u *)&addr, hostname, port);
+  if (ret < 0) {
     return -1;
   }
-  if (!(flags & FD_CLOEXEC)) {
-    if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == -1) {
+  ret = bufferevent_socket_connect(bev, (struct sockaddr *)(&(addr.sin)),
+                                   sizeof(addr.sin));
+  return ret;
+}
+
+evutil_socket_t accept4(evutil_socket_t sockfd, struct sockaddr *addr,
+                        ev_socklen_t *addrlen, int flags) {
+  evutil_socket_t result;
+  result = accept(sockfd, addr, addrlen);
+  if (result < 0)
+    return result;
+
+  if (flags & EVUTIL_SOCK_CLOEXEC) {
+    if (evutil_make_socket_closeonexec(result) < 0) {
+      evutil_closesocket(result);
       return -1;
     }
   }
-  return 0;
+  if (flags & EVUTIL_SOCK_NONBLOCK) {
+    if (evutil_make_socket_nonblocking(result) < 0) {
+      evutil_closesocket(result);
+      return -1;
+    }
+  }
+  return result;
 }
 
-int evutil_inet_pton(int af, const char *src, void *dst) {
-  return inet_pton(af, src, dst);
+static void listener_read_cb(evutil_socket_t fd, short what, void *p) {
+  struct evconnlistener *lev = (struct evconnlistener *)p;
+  int err;
+  evconnlistener_cb cb;
+  evconnlistener_errorcb errorcb;
+  void *user_data;
+  while (1) {
+    struct sockaddr_storage ss;
+    ev_socklen_t socklen = sizeof(ss);
+    evutil_socket_t new_fd =
+        accept4(fd, (struct sockaddr *)&ss, &socklen, lev->accept4_flags);
+    if (new_fd < 0)
+      break;
+    if (socklen == 0) {
+      /* This can happen with some older linux kernels in
+       * response to nmap. */
+      evutil_closesocket(new_fd);
+      continue;
+    }
+
+    if (lev->cb == NULL) {
+      evutil_closesocket(new_fd);
+      return;
+    }
+    cb = lev->cb;
+    user_data = lev->user_data;
+    cb(lev, new_fd, (struct sockaddr *)&ss, (int)socklen, user_data);
+
+    if (!lev->enabled) {
+      /* the callback could have disabled the listener */
+      return;
+    }
+  }
+  err = evutil_socket_geterror(fd);
+  if (EVUTIL_ERR_ACCEPT_RETRIABLE(err)) {
+    return;
+  }
+  if (lev->errorcb != NULL) {
+    errorcb = lev->errorcb;
+    user_data = lev->user_data;
+    errorcb(lev, user_data);
+  } else {
+    return;
+  }
 }
 
-const char *evutil_inet_ntop(int af, const void *src, char *dst, size_t len) {
-  return inet_ntop(af, src, dst, len);
+struct evconnlistener *evconnlistener_new(struct event_base *base,
+                                          evconnlistener_cb cb, void *ptr,
+                                          unsigned flags, int backlog,
+                                          evutil_socket_t fd) {
+  struct evconnlistener_event *lev;
+  if (backlog > 0) {
+    if (listen(fd, backlog) < 0)
+      return NULL;
+  } else if (backlog < 0) {
+    if (listen(fd, 128) < 0)
+      return NULL;
+  }
+  HV_ALLOC(lev, sizeof(struct evconnlistener_event));
+  if (!lev)
+    return NULL;
+
+  lev->base.cb = cb;
+  lev->base.user_data = ptr;
+  lev->base.flags = flags;
+
+  lev->base.accept4_flags = 0;
+  if (!(flags & LEV_OPT_LEAVE_SOCKETS_BLOCKING))
+    lev->base.accept4_flags |= EVUTIL_SOCK_NONBLOCK;
+  if (flags & LEV_OPT_CLOSE_ON_EXEC)
+    lev->base.accept4_flags |= EVUTIL_SOCK_CLOEXEC;
+
+  event_assign(&lev->listener, base, fd, EV_READ | EV_PERSIST, listener_read_cb,
+               lev);
+
+  // evconnlistener_enable(&lev->base);
+  if (!(flags & LEV_OPT_DISABLED)) {
+    lev->base.enabled = 1;
+    if (lev->base.cb) {
+      event_add(&(lev->listener), NULL);
+    }
+  }
+
+  return &lev->base;
 }
 
 HV_INLINE struct event_base *event_base_new(void) {
