@@ -48,12 +48,10 @@ typedef int evutil_socket_t;
 typedef void (*event_callback_fn)(evutil_socket_t fd, short events,
                                   void *callback_arg);
 
-enum bufferevent_options {
-  BEV_OPT_CLOSE_ON_FREE = (1 << 0),
-  BEV_OPT_THREADSAFE = (1 << 1),
-  BEV_OPT_DEFER_CALLBACKS = (1 << 2),
-  BEV_OPT_UNLOCK_CALLBACKS = (1 << 3)
-};
+#define BEV_OPT_CLOSE_ON_FREE (1 << 0)
+#define BEV_OPT_THREADSAFE (1 << 1)
+#define BEV_OPT_DEFER_CALLBACKS (1 << 2)
+#define BEV_OPT_UNLOCK_CALLBACKS (1 << 3)
 
 struct event {
   struct event_base *base;

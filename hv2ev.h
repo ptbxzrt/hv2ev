@@ -459,6 +459,7 @@ struct bufferevent {
   short enabled;
   unsigned connecting;
   unsigned connection_refused;
+  int options;
 };
 
 #define EVBUFFER_MAX_READ 4096
@@ -579,11 +580,19 @@ struct bufferevent *bufferevent_socket_new(struct event_base *base,
   bufev->enabled = 0;
   bufev->connecting = 0;
   bufev->connection_refused = 0;
+  bufev->options = options;
 
   return bufev;
 }
 
 void bufferevent_free(struct bufferevent *bufev) {
+  int fd = bufev->ev_read.fd;
+
+  event_del(&bufev->ev_read);
+  event_del(&bufev->ev_write);
+  event_del(&bufev->ev_err);
+  if ((bufev->options & BEV_OPT_CLOSE_ON_FREE) && fd >= 0)
+    close(fd);
   if (bufev->input) {
     evbuffer_free(bufev->input);
   }
@@ -924,8 +933,12 @@ struct evconnlistener *evconnlistener_new(struct event_base *base,
   return &lev->base;
 }
 
-void
-evconnlistener_free(struct evconnlistener *lev) {
+void evconnlistener_free(struct evconnlistener *lev) {
+  struct evconnlistener_event *lev_e = lev->lev_e;
+  event_del(&lev_e->listener);
+  if (lev->flags & LEV_OPT_CLOSE_ON_FREE) {
+    close(lev_e->listener.fd);
+  }
   HV_FREE(lev);
 }
 
@@ -1000,16 +1013,14 @@ size_t bufferevent_read(struct bufferevent *bufev, void *data, size_t size) {
   return (evbuffer_remove(bufev->input, data, size));
 }
 
-int
-evconnlistener_enable(struct evconnlistener *lev)
-{
-	int r;
-	lev->enabled = 1;
-	if (lev->cb)
-		r = event_add(&lev->lev_e->listener, NULL);
-	else
-		r = 0;
-	return r;
+int evconnlistener_enable(struct evconnlistener *lev) {
+  int r;
+  lev->enabled = 1;
+  if (lev->cb)
+    r = event_add(&lev->lev_e->listener, NULL);
+  else
+    r = 0;
+  return r;
 }
 
 HV_INLINE struct event_base *event_base_new(void) {
