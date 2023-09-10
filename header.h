@@ -42,10 +42,18 @@
 #define EVUTIL_SOCK_CLOEXEC SOCK_CLOEXEC
 #define EVUTIL_SOCK_NONBLOCK SOCK_NONBLOCK
 #define ev_socklen_t socklen_t
+#define MAX_TO_REALIGN_IN_EXPAND 2048
 
 typedef int evutil_socket_t;
 typedef void (*event_callback_fn)(evutil_socket_t fd, short events,
                                   void *callback_arg);
+
+enum bufferevent_options {
+  BEV_OPT_CLOSE_ON_FREE = (1 << 0),
+  BEV_OPT_THREADSAFE = (1 << 1),
+  BEV_OPT_DEFER_CALLBACKS = (1 << 2),
+  BEV_OPT_UNLOCK_CALLBACKS = (1 << 3)
+};
 
 struct event {
   struct event_base *base;
@@ -97,6 +105,7 @@ typedef void (*evconnlistener_cb)(struct evconnlistener *, evutil_socket_t,
 typedef void (*evconnlistener_errorcb)(struct evconnlistener *, void *);
 
 struct evconnlistener {
+  evconnlistener_event *lev_e;
   evconnlistener_cb cb;
   evconnlistener_errorcb errorcb;
   void *user_data;
@@ -122,5 +131,6 @@ struct evconnlistener_event {
 
 void event_active(struct event *ev, int res, short ncalls);
 int bufferevent_disable(struct bufferevent *bufev, short event);
+void evbuffer_chain_free(struct evbuffer_chain *chain);
 
 #endif

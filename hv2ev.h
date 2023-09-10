@@ -41,8 +41,7 @@ void evbuffer_free(struct evbuffer *buffer) {
   struct evbuffer_chain *p = buffer->first;
   while (p != NULL) {
     struct evbuffer_chain *next = p->next;
-    HV_FREE(p->buf.base);
-    HV_FREE(p);
+    evbuffer_chain_free(p);
     p = next;
   }
   HV_FREE(buffer);
@@ -77,20 +76,42 @@ void evbuffer_chain_free(struct evbuffer_chain *chain) {
     if (cleanupfn != NULL) {
       cleanupfn(chain->buf.base, chain->buf.len, chain->args);
     }
+    return;
   } else {
     HV_FREE(chain->buf.base);
   }
   HV_FREE(chain);
 }
 
+static void clear_free_chains_list(struct evbuffer_chain *chain) {
+  struct evbuffer_chain *next;
+  for (; chain; chain = next) {
+    next = chain->next;
+    evbuffer_chain_free(chain);
+  }
+}
+
 void evbuffer_chain_insert(struct evbuffer *buf, struct evbuffer_chain *chain) {
   if (buf->last == NULL) {
     buf->first = chain;
     buf->last = chain;
+    buf->last_with_datap = chain;
   } else {
-    buf->last->next = chain;
-    buf->last = chain;
+    if (buf->total_len == 0) {
+      clear_free_chains_list(buf->first);
+      buf->first = chain;
+      buf->last = chain;
+      buf->last_with_datap = chain;
+    } else {
+      clear_free_chains_list(buf->last_with_datap->next);
+      buf->last_with_datap->next = chain;
+      buf->last = chain;
+      if (chain->off > 0) {
+        buf->last_with_datap = chain;
+      }
+    }
   }
+  buf->total_len += chain->off;
 }
 
 int evbuffer_add(struct evbuffer *buf, const void *data_in, size_t datalen) {
@@ -132,6 +153,21 @@ int evbuffer_add(struct evbuffer *buf, const void *data_in, size_t datalen) {
   return 0;
 }
 
+/** Helper: return true iff we should realign chain to fit datalen bytes of
+    data in it. */
+static int evbuffer_chain_should_realign(struct evbuffer_chain *chain,
+                                         size_t datlen) {
+  return chain->buf.len - chain->off >= datlen &&
+         (chain->off < chain->buf.len / 2) &&
+         (chain->off <= MAX_TO_REALIGN_IN_EXPAND);
+}
+
+/** Helper: realigns the memory in chain->buffer so that misalign is 0. */
+static void evbuffer_chain_align(struct evbuffer_chain *chain) {
+  memmove(chain->buf.base, chain->buf.base + chain->misalign, chain->off);
+  chain->misalign = 0;
+}
+
 int evbuffer_expand(struct evbuffer *buf, size_t datalen) {
   struct evbuffer_chain *chain = buf->last_with_datap;
 
@@ -144,6 +180,11 @@ int evbuffer_expand(struct evbuffer *buf, size_t datalen) {
     // 注意：如果有chain，但没有数据，last_with_datap也应该指向first
     buf->last_with_datap = chain;
   } else {
+    if (evbuffer_chain_should_realign(chain, datalen)) {
+      evbuffer_chain_align(chain);
+      return 0;
+    }
+
     int total_free_space = 0;
     struct evbuffer_chain *p = chain;
     while (p != NULL) {
@@ -381,7 +422,7 @@ int evbuffer_add_reference(struct evbuffer *buf, const void *data,
                            size_t datalen, evbuffer_ref_cleanup_cb cleanupfn,
                            void *args) {
   struct evbuffer_chain *chain = evbuffer_chain_new(datalen);
-  chain->flags |= EVBUFFER_REFERENCE | EVBUFFER_IMMUTABLE;
+  chain->flags |= (EVBUFFER_REFERENCE | EVBUFFER_IMMUTABLE);
   chain->cleanupfn = cleanupfn;
   chain->args = args;
   chain->buf.base = (char *)data;
@@ -556,6 +597,13 @@ int bufferevent_write_buffer(struct bufferevent *bufev, struct evbuffer *buf) {
   evbuffer_add_buffer(bufev->output, buf);
   event_add(&(bufev->ev_write), &(bufev->timeout_write));
   // bufev->enabled |= EV_WRITE;
+  return 0;
+}
+
+int bufferevent_write(struct bufferevent *bufev, const void *data,
+                      size_t size) {
+  if (evbuffer_add(bufev->output, data, size) == -1)
+    return (-1);
   return 0;
 }
 
@@ -854,6 +902,7 @@ struct evconnlistener *evconnlistener_new(struct event_base *base,
   lev->base.cb = cb;
   lev->base.user_data = ptr;
   lev->base.flags = flags;
+  lev->base.lev_e = lev;
 
   lev->base.accept4_flags = 0;
   if (!(flags & LEV_OPT_LEAVE_SOCKETS_BLOCKING))
@@ -873,6 +922,94 @@ struct evconnlistener *evconnlistener_new(struct event_base *base,
   }
 
   return &lev->base;
+}
+
+void
+evconnlistener_free(struct evconnlistener *lev) {
+  HV_FREE(lev);
+}
+
+struct evconnlistener *evconnlistener_new_bind(struct event_base *base,
+                                               evconnlistener_cb cb, void *ptr,
+                                               unsigned flags, int backlog,
+                                               const struct sockaddr *sa,
+                                               int socklen) {
+  struct evconnlistener *listener;
+  evutil_socket_t fd;
+  int on = 1;
+  int family = sa ? sa->sa_family : AF_UNSPEC;
+  int socktype = SOCK_STREAM | EVUTIL_SOCK_NONBLOCK;
+
+  if (backlog == 0)
+    return NULL;
+
+  if (flags & LEV_OPT_CLOSE_ON_EXEC)
+    socktype |= EVUTIL_SOCK_CLOEXEC;
+
+  fd = socket(family, socktype, 0);
+  if (fd == -1)
+    return NULL;
+
+  if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&on, sizeof(on)) < 0)
+    goto err;
+
+  if (flags & LEV_OPT_REUSEABLE) {
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (void *)&one,
+                   (ev_socklen_t)sizeof(one)) < 0)
+      goto err;
+  }
+
+  if (flags & LEV_OPT_REUSEABLE_PORT) {
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (void *)&one,
+                   (ev_socklen_t)sizeof(one)) < 0)
+      goto err;
+  }
+
+  if (flags & LEV_OPT_DEFERRED_ACCEPT) {
+    int one = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &one,
+                   (ev_socklen_t)sizeof(one)) < 0)
+      goto err;
+  }
+
+  if (flags & LEV_OPT_BIND_IPV6ONLY) {
+    int one = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &one,
+                   (ev_socklen_t)sizeof(one)) < 0)
+      goto err;
+  }
+
+  if (sa) {
+    if (bind(fd, sa, socklen) < 0)
+      goto err;
+  }
+
+  listener = evconnlistener_new(base, cb, ptr, flags, backlog, fd);
+  if (!listener)
+    goto err;
+
+  return listener;
+err:
+  evutil_closesocket(fd);
+  return NULL;
+}
+
+size_t bufferevent_read(struct bufferevent *bufev, void *data, size_t size) {
+  return (evbuffer_remove(bufev->input, data, size));
+}
+
+int
+evconnlistener_enable(struct evconnlistener *lev)
+{
+	int r;
+	lev->enabled = 1;
+	if (lev->cb)
+		r = event_add(&lev->lev_e->listener, NULL);
+	else
+		r = 0;
+	return r;
 }
 
 HV_INLINE struct event_base *event_base_new(void) {

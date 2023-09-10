@@ -647,74 +647,297 @@ end:
   evbuffer_free(evb_two);
 }
 
-// TEST_CASE("test_evbuffer_expand") {
-//   char data[4096];
-//   struct evbuffer *buf;
-//   size_t a, w, u;
-//   void *buffer;
+static void evbuffer_get_waste(struct evbuffer *buf, size_t *allocatedp,
+                               size_t *wastedp, size_t *usedp) {
+  struct evbuffer_chain *chain;
+  size_t a, w, u;
+  int n = 0;
+  u = a = w = 0;
 
-//   memset(data, 'X', sizeof(data));
+  chain = buf->first;
+  /* skip empty at start */
+  while (chain && chain->off == 0) {
+    ++n;
+    a += chain->buf.len;
+    chain = chain->next;
+  }
+  /* first nonempty chain: stuff at the end only is wasted. */
+  if (chain) {
+    ++n;
+    a += chain->buf.len;
+    u += chain->off;
+    if (chain->next && chain->next->off)
+      w += (size_t)(chain->buf.len - (chain->misalign + chain->off));
+    chain = chain->next;
+  }
+  /* subsequent nonempty chains */
+  while (chain && chain->off) {
+    ++n;
+    a += chain->buf.len;
+    w += (size_t)chain->misalign;
+    u += chain->off;
+    if (chain->next && chain->next->off)
+      w += (size_t)(chain->buf.len - (chain->misalign + chain->off));
+    chain = chain->next;
+  }
+  /* subsequent empty chains */
+  while (chain) {
+    ++n;
+    a += chain->buf.len;
+  }
+  *allocatedp = a;
+  *wastedp = w;
+  *usedp = u;
+}
 
-//   /* Make sure that expand() works on an empty buffer */
-//   buf = evbuffer_new();
-//   CHECK_EQ(evbuffer_expand(buf, 20000), 0);
-//   evbuffer_validate(buf);
-//   a = w = u = 0;
-//   evbuffer_get_waste(buf, &a, &w, &u);
-//   CHECK(w == 0);
-//   CHECK(u == 0);
-//   CHECK(a >= 20000);
-//   CHECK(buf->first);
-//   CHECK(buf->first == buf->last);
-//   CHECK(buf->first->off == 0);
-//   CHECK(buf->first->buf.len >= 20000);
+TEST_CASE("test_evbuffer_expand") {
+  char data[4096];
+  struct evbuffer *buf;
+  size_t a, w, u;
+  void *buffer;
 
-//   /* Make sure that expand() works as a no-op when there's enough
-//    * contiguous space already. */
-//   buffer = buf->first->buf.base;
-//   evbuffer_add(buf, data, 1024);
-//   CHECK_EQ(evbuffer_expand(buf, 1024), 0);
-//   CHECK(buf->first->buf.base == buffer);
-//   evbuffer_validate(buf);
-//   evbuffer_free(buf);
+  memset(data, 'X', sizeof(data));
 
-//   /* Make sure that expand() can work by moving misaligned data
-//    * when it makes sense to do so. */
-//   buf = evbuffer_new();
-//   evbuffer_add(buf, data, 400);
-//   {
-//     int n = (int)(buf->first->buf.len - buf->first->off - 1);
-//     CHECK(n < (int)sizeof(data));
-//     evbuffer_add(buf, data, n);
-//   }
-//   CHECK(buf->first == buf->last);
-//   CHECK(buf->first->off == buf->first->buf.len - 1);
-//   evbuffer_drain(buf, buf->first->off - 1);
-//   CHECK(1 == evbuffer_get_length(buf));
-//   CHECK(buf->first->misalign > 0);
-//   CHECK(buf->first->off == 1);
-//   buffer = buf->first->buf.base;
-//   CHECK(evbuffer_expand(buf, 40) == 0);
-//   CHECK(buf->first == buf->last);
-//   CHECK(buf->first->off == 1);
-//   CHECK(buf->first->buf.base == buffer);
-//   CHECK(buf->first->misalign == 0);
-//   evbuffer_validate(buf);
-//   evbuffer_free(buf);
+  /* Make sure that expand() works on an empty buffer */
+  buf = evbuffer_new();
+  CHECK_EQ(evbuffer_expand(buf, 20000), 0);
+  evbuffer_validate(buf);
+  a = w = u = 0;
+  evbuffer_get_waste(buf, &a, &w, &u);
+  CHECK(w == 0);
+  CHECK(u == 0);
+  CHECK(a >= 20000);
+  CHECK(buf->first);
+  CHECK(buf->first == buf->last);
+  CHECK(buf->first->off == 0);
+  CHECK(buf->first->buf.len >= 20000);
 
-//   /* add, expand, pull-up: This used to crash libevent. */
-//   buf = evbuffer_new();
+  /* Make sure that expand() works as a no-op when there's enough
+   * contiguous space already. */
+  buffer = buf->first->buf.base;
+  evbuffer_add(buf, data, 1024);
+  CHECK_EQ(evbuffer_expand(buf, 1024), 0);
+  CHECK(buf->first->buf.base == buffer);
+  evbuffer_validate(buf);
+  evbuffer_free(buf);
 
-//   evbuffer_add(buf, data, sizeof(data));
-//   evbuffer_add(buf, data, sizeof(data));
-//   evbuffer_add(buf, data, sizeof(data));
+  /* Make sure that expand() can work by moving misaligned data
+   * when it makes sense to do so. */
+  buf = evbuffer_new();
+  evbuffer_add(buf, data, 400);
+  {
+    int n = (int)(buf->first->buf.len - buf->first->off - 1);
+    CHECK(n < (int)sizeof(data));
+    evbuffer_add(buf, data, n);
+  }
+  CHECK(buf->first == buf->last);
+  CHECK(buf->first->off == buf->first->buf.len - 1);
+  evbuffer_drain(buf, buf->first->off - 1);
+  CHECK(1 == evbuffer_get_length(buf));
+  CHECK(buf->first->misalign > 0);
+  CHECK(buf->first->off == 1);
+  buffer = buf->first->buf.base;
+  CHECK(evbuffer_expand(buf, 40) == 0);
+  CHECK(buf->first == buf->last);
+  CHECK(buf->first->off == 1);
+  CHECK(buf->first->buf.base == buffer);
+  CHECK(buf->first->misalign == 0);
+  evbuffer_validate(buf);
+  evbuffer_free(buf);
 
-//   evbuffer_validate(buf);
-//   evbuffer_expand(buf, 1024);
-//   evbuffer_validate(buf);
-//   evbuffer_pullup(buf, -1);
-//   evbuffer_validate(buf);
+  /* add, expand, pull-up: This used to crash libevent. */
+  buf = evbuffer_new();
 
-// end:
-//   evbuffer_free(buf);
-// }
+  evbuffer_add(buf, data, sizeof(data));
+  evbuffer_add(buf, data, sizeof(data));
+  evbuffer_add(buf, data, sizeof(data));
+
+  evbuffer_validate(buf);
+  evbuffer_expand(buf, 1024);
+  evbuffer_validate(buf);
+  evbuffer_pullup(buf, -1);
+  evbuffer_validate(buf);
+
+end:
+  evbuffer_free(buf);
+}
+
+static void no_cleanup(const void *data, size_t datalen, void *extra) {}
+
+TEST_CASE("test_evbuffer_remove_buffer_with_empty") {
+  struct evbuffer *src = evbuffer_new();
+  struct evbuffer *dst = evbuffer_new();
+  char buf[2] = {'A', 'A'};
+
+  evbuffer_validate(src);
+  evbuffer_validate(dst);
+
+  /* setup the buffers */
+  /* we need more data in src than we will move later */
+  evbuffer_add_reference(src, buf, sizeof(buf), no_cleanup, NULL);
+  evbuffer_add_reference(src, buf, sizeof(buf), no_cleanup, NULL);
+  /* we need one buffer in dst and one empty buffer at the end */
+  evbuffer_add(dst, buf, sizeof(buf));
+  evbuffer_add_reference(dst, buf, 0, no_cleanup, NULL);
+
+  evbuffer_validate(src);
+  evbuffer_validate(dst);
+  CHECK_EQ(memcmp(evbuffer_pullup(src, -1), "AAAA", 4), 0);
+  CHECK_EQ(memcmp(evbuffer_pullup(dst, -1), "AA", 2), 0);
+
+end:
+  evbuffer_free(src);
+  evbuffer_free(dst);
+}
+
+TEST_CASE("test_evbuffer_remove_buffer_with_empty2") {
+  struct evbuffer *src = evbuffer_new();
+  struct evbuffer *dst = evbuffer_new();
+  struct evbuffer *buf = evbuffer_new();
+
+  evbuffer_add(buf, "foo", 3);
+  evbuffer_add_reference(buf, "foo", 3, NULL, NULL);
+
+  evbuffer_add_reference(src, "foo", 3, NULL, NULL);
+  evbuffer_add_reference(src, NULL, 0, NULL, NULL);
+  evbuffer_add_buffer(src, buf);
+
+  evbuffer_add(buf, "foo", 3);
+  evbuffer_add_reference(buf, "foo", 3, NULL, NULL);
+
+  evbuffer_add_reference(dst, "foo", 3, NULL, NULL);
+  evbuffer_add_reference(dst, NULL, 0, NULL, NULL);
+  evbuffer_add_buffer(dst, buf);
+
+  CHECK(evbuffer_get_length(src) == 9);
+  CHECK(evbuffer_get_length(dst) == 9);
+
+  evbuffer_validate(src);
+  evbuffer_validate(dst);
+
+  CHECK_EQ(memcmp(evbuffer_pullup(src, -1), "foofoofoo", 9), 0);
+  CHECK_EQ(memcmp(evbuffer_pullup(dst, -1), "foofoofoo", 9), 0);
+
+end:
+  evbuffer_free(src);
+  evbuffer_free(dst);
+  evbuffer_free(buf);
+}
+
+#define TEST_STR                                                               \
+  "Now is the time for all good events to signal for "                         \
+  "the good of their protocol"
+
+static int n_strings_read = 0;
+static int n_reads_invoked = 0;
+
+static void sender_writecb(struct bufferevent *bev, void *ctx) {
+  if (evbuffer_get_length(bufferevent_get_output(bev)) == 0) {
+    bufferevent_disable(bev, EV_READ | EV_WRITE);
+    bufferevent_free(bev);
+  }
+}
+
+static void sender_errorcb(struct bufferevent *bev, short what, void *ctx) {
+  FAIL(("Got sender error %d", (int)what));
+}
+
+static void listen_cb(struct evconnlistener *listener, evutil_socket_t fd,
+                      struct sockaddr *sa, int socklen, void *arg) {
+  struct event_base *base = (struct event_base *)arg;
+  struct bufferevent *bev;
+  const char s[] = TEST_STR;
+  bev = bufferevent_socket_new(base, fd, bufferevent_connect_test_flags);
+  CHECK(bev);
+  bufferevent_setcb(bev, NULL, sender_writecb, sender_errorcb, NULL);
+  bufferevent_write(bev, s, sizeof(s));
+end:;
+}
+
+static void reader_readcb(struct bufferevent *bev, void *ctx) {
+  n_reads_invoked++;
+}
+
+static void reader_eventcb(struct bufferevent *bev, short what, void *ctx) {
+  struct event_base *base = (struct event_base *)ctx;
+  if (what & BEV_EVENT_ERROR) {
+    perror("foobar");
+    FAIL(("got connector error %d", (int)what));
+    return;
+  }
+  if (what & BEV_EVENT_CONNECTED) {
+    bufferevent_enable(bev, EV_READ);
+  }
+  if (what & BEV_EVENT_EOF) {
+    char buf[512];
+    size_t n;
+    n = bufferevent_read(bev, buf, sizeof(buf) - 1);
+    CHECK(n >= 0);
+    buf[n] = '\0';
+    CHECK(strcmp(buf, TEST_STR) == 0);
+    if (++n_strings_read == 2)
+      event_base_loopexit(base, NULL);
+  }
+end:;
+}
+
+static int bufferevent_connect_test_flags = 0;
+
+TEST_CASE("test_bufferevent_connect") {
+  struct event_base *base = event_base_new();
+  struct evconnlistener *lev = NULL;
+  struct bufferevent *bev1 = NULL, *bev2 = NULL;
+  struct sockaddr_in localhost;
+  struct sockaddr_storage ss;
+  struct sockaddr *sa;
+  ev_socklen_t slen;
+
+  int be_flags = BEV_OPT_CLOSE_ON_FREE;
+  bufferevent_connect_test_flags = be_flags;
+
+  memset(&localhost, 0, sizeof(localhost));
+
+  localhost.sin_port = 0; /* pick-a-port */
+  localhost.sin_addr.s_addr = htonl(0x7f000001L);
+  localhost.sin_family = AF_INET;
+  sa = (struct sockaddr *)&localhost;
+  lev = evconnlistener_new_bind(base, listen_cb, base,
+                                LEV_OPT_CLOSE_ON_FREE | LEV_OPT_REUSEABLE, 16,
+                                sa, sizeof(localhost));
+  CHECK(lev);
+
+  sa = (struct sockaddr *)&ss;
+  slen = sizeof(ss);
+  if (getsockname(lev->lev_e->listener.fd, sa, &slen) < 0) {
+    FAIL("getsockname");
+  }
+
+  CHECK(!evconnlistener_enable(lev));
+  bev1 = bufferevent_socket_new(base, -1, be_flags);
+  bev2 = bufferevent_socket_new(base, -1, be_flags);
+  CHECK(bev1);
+  CHECK(bev2);
+  bufferevent_setcb(bev1, reader_readcb, NULL, reader_eventcb, base);
+  bufferevent_setcb(bev2, reader_readcb, NULL, reader_eventcb, base);
+
+  bufferevent_enable(bev1, EV_READ);
+  bufferevent_enable(bev2, EV_READ);
+
+  CHECK(!bufferevent_socket_connect(bev1, sa, sizeof(localhost)));
+  CHECK(!bufferevent_socket_connect(bev2, sa, sizeof(localhost)));
+
+  event_base_dispatch(base);
+
+  CHECK(n_strings_read == 2);
+  CHECK(n_reads_invoked >= 2);
+end:
+  if (lev)
+    evconnlistener_free(lev);
+
+  if (bev1)
+    bufferevent_free(bev1);
+
+  if (bev2)
+    bufferevent_free(bev2);
+  event_base_free(base);
+}
