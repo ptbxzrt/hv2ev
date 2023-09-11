@@ -22,6 +22,8 @@
 #define evtimer_add(ev, tv) event_add((ev), (tv))
 #define evtimer_del(ev) event_del(ev)
 #define evtimer_new(b, cb, arg) event_new((b), -1, 0, (cb), (arg))
+#define evtimer_assign(ev, b, cb, arg)                                         \
+  event_assign((ev), (b), -1, 0, (cb), (arg))
 #define evutil_timerclear(tvp) timerclear(tvp)
 #define evutil_socket_geterror(sock) (errno)
 #define EVUTIL_ERR_CONNECT_RETRIABLE(e) ((e) == EINTR || (e) == EINPROGRESS)
@@ -44,6 +46,7 @@
 #define EVUTIL_SOCK_NONBLOCK SOCK_NONBLOCK
 #define ev_socklen_t socklen_t
 #define MAX_TO_REALIGN_IN_EXPAND 2048
+#define evutil_socket_error_to_string(errcode) (strerror(errcode))
 
 typedef int evutil_socket_t;
 typedef void (*event_callback_fn)(evutil_socket_t fd, short events,

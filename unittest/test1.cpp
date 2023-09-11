@@ -273,7 +273,7 @@ long timeval_msec_diff(const struct timeval *start, const struct timeval *end) {
   long ms = end->tv_sec - start->tv_sec;
   ms *= 1000;
   ms += ((end->tv_usec - start->tv_usec) + 500) / 1000;
-  printf("time duration(ms): %ld\n", ms);
+  // // printf("time duration(ms): %ld\n", ms);
   return ms;
 }
 
@@ -831,9 +831,10 @@ end:
 static int n_strings_read = 0;
 static int n_reads_invoked = 0;
 static int bufferevent_connect_test_flags = 0;
+static int bufferevent_trigger_test_flags = 0;
 
 static void sender_writecb(struct bufferevent *bev, void *ctx) {
-  printf("sender_writecb\n");
+  // // printf("sender_writecb\n");
   if (evbuffer_get_length(bufferevent_get_output(bev)) == 0) {
     bufferevent_disable(bev, EV_READ | EV_WRITE);
     bufferevent_free(bev);
@@ -846,7 +847,7 @@ static void sender_errorcb(struct bufferevent *bev, short what, void *ctx) {
 
 static void listen_cb(struct evconnlistener *listener, evutil_socket_t fd,
                       struct sockaddr *sa, int socklen, void *arg) {
-  printf("listen_cb\n");
+  // // printf("listen_cb\n");
   struct event_base *base = (struct event_base *)arg;
   struct bufferevent *bev;
   const char s[] = TEST_STR;
@@ -858,25 +859,25 @@ end:;
 }
 
 static void reader_readcb(struct bufferevent *bev, void *ctx) {
-  printf("reader_readcb\n");
+  // printf("reader_readcb\n");
   n_reads_invoked++;
 }
 
 static void reader_eventcb(struct bufferevent *bev, short what, void *ctx) {
-  printf("reader_eventcb\n");
+  // printf("reader_eventcb\n");
   struct event_base *base = (struct event_base *)ctx;
   if (what & BEV_EVENT_ERROR) {
-    printf("BEV_EVENT_ERROR\n");
+    // printf("BEV_EVENT_ERROR\n");
     perror("foobar");
     FAIL(("got connector error %d", (int)what));
     return;
   }
   if (what & BEV_EVENT_CONNECTED) {
-    printf("BEV_EVENT_CONNECTED\n");
+    // printf("BEV_EVENT_CONNECTED\n");
     bufferevent_enable(bev, EV_READ);
   }
   if (what & BEV_EVENT_EOF) {
-    printf("BEV_EVENT_EOF\n");
+    // printf("BEV_EVENT_EOF\n");
     char buf[512];
     size_t n;
     n = bufferevent_read(bev, buf, sizeof(buf) - 1);
@@ -890,6 +891,10 @@ end:;
 }
 
 TEST_CASE("test_bufferevent_connect") {
+  n_strings_read = 0;
+  n_reads_invoked = 0;
+  bufferevent_connect_test_flags = 0;
+
   struct event_base *base = event_base_new();
   struct evconnlistener *lev = NULL;
   struct bufferevent *bev1 = NULL, *bev2 = NULL;
@@ -945,5 +950,393 @@ end:
 
   if (bev2)
     bufferevent_free(bev2);
+  event_base_free(base);
+}
+
+static int n_events_invoked = 0;
+
+static evutil_socket_t fake_listener_create(struct sockaddr_in *localhost) {
+  struct sockaddr *sa = (struct sockaddr *)localhost;
+  evutil_socket_t fd = -1;
+  ev_socklen_t slen = sizeof(*localhost);
+
+  memset(localhost, 0, sizeof(*localhost));
+  localhost->sin_port = 0; /* have the kernel pick a port */
+  localhost->sin_addr.s_addr = htonl(0x7f000001L);
+  localhost->sin_family = AF_INET;
+
+  /* bind, but don't listen or accept. should trigger
+     "Connection refused" reliably on most platforms. */
+  fd = socket(localhost->sin_family, SOCK_STREAM, 0);
+  CHECK(fd >= 0);
+  CHECK(bind(fd, sa, slen) == 0);
+  CHECK(getsockname(fd, sa, &slen) == 0);
+
+  return fd;
+
+end:
+  return -1;
+}
+
+static void reader_eventcb_simple(struct bufferevent *bev, short what,
+                                  void *ctx) {
+  n_events_invoked++;
+}
+
+static void close_socket_cb(evutil_socket_t fd, short what, void *arg) {
+  evutil_socket_t *fdp = (evutil_socket_t *)arg;
+  if (*fdp >= 0) {
+    evutil_closesocket(*fdp);
+    *fdp = -1;
+  }
+}
+
+TEST_CASE("test_bufferevent_connect_fail_eventcb") {
+  n_strings_read = 0;
+  n_reads_invoked = 0;
+  bufferevent_connect_test_flags = 0;
+  n_events_invoked = 0;
+
+  struct event_base *base = event_base_new();
+  int flags = BEV_OPT_CLOSE_ON_FREE;
+  struct event close_listener_event;
+  struct bufferevent *bev = NULL;
+  struct evconnlistener *lev = NULL;
+  struct sockaddr_in localhost;
+  struct timeval close_timeout = {0, 300000};
+  ev_socklen_t slen = sizeof(localhost);
+  evutil_socket_t fake_listener = -1;
+  int r;
+
+  fake_listener = fake_listener_create(&localhost);
+
+  CHECK(n_events_invoked == 0);
+
+  bev = bufferevent_socket_new(base, -1, flags);
+  CHECK(bev);
+  bufferevent_setcb(bev, reader_readcb, reader_readcb, reader_eventcb_simple,
+                    base);
+  bufferevent_enable(bev, EV_READ | EV_WRITE);
+  CHECK(n_events_invoked == 0);
+  CHECK(n_reads_invoked == 0);
+
+  /** @see also test_bufferevent_connect_fail() */
+  r = bufferevent_socket_connect(bev, (struct sockaddr *)&localhost, slen);
+  /* XXXX we'd like to test the '0' case everywhere, but FreeBSD tells
+   * detects the error immediately, which is not really wrong of it. */
+  short temp = (r == 0 /*|| r == -1*/);
+  CHECK(temp);
+
+  CHECK(n_events_invoked == 0);
+  CHECK(n_reads_invoked == 0);
+
+  /* Close the listener socket after a delay. This should trigger
+     "connection refused" on some other platforms, including OSX. */
+  evtimer_assign(&close_listener_event, base, close_socket_cb, &fake_listener);
+  event_add(&close_listener_event, &close_timeout);
+
+  event_base_dispatch(base);
+  CHECK(n_events_invoked == 1);
+  CHECK(n_reads_invoked == 0);
+
+end:
+  if (lev)
+    evconnlistener_free(lev);
+  if (bev)
+    bufferevent_free(bev);
+  if (fake_listener >= 0)
+    evutil_closesocket(fake_listener);
+  event_base_free(base);
+}
+
+static int test_ok = 0;
+
+static void want_fail_eventcb(struct bufferevent *bev, short what, void *ctx) {
+  struct event_base *base = (struct event_base *)ctx;
+  const char *err;
+  evutil_socket_t s;
+
+  if (what & BEV_EVENT_ERROR) {
+    s = bev->ev_read.fd;
+    err = evutil_socket_error_to_string(evutil_socket_geterror(s));
+    test_ok = 1;
+  } else {
+    FAIL(("didn't fail? what %hd", what));
+  }
+
+  event_base_loopexit(base, NULL);
+}
+
+TEST_CASE("test_bufferevent_connect_fail") {
+  struct event_base *base = event_base_new();
+  struct bufferevent *bev = NULL;
+  struct event close_listener_event;
+  int close_listener_event_added = 0;
+  struct timeval close_timeout = {0, 300000};
+  struct sockaddr_in localhost;
+  ev_socklen_t slen = sizeof(localhost);
+  evutil_socket_t fake_listener = -1;
+  int r;
+
+  test_ok = 0;
+
+  fake_listener = fake_listener_create(&localhost);
+  bev = bufferevent_socket_new(base, -1,
+                               BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+  CHECK(bev);
+  bufferevent_setcb(bev, NULL, NULL, want_fail_eventcb, base);
+
+  r = bufferevent_socket_connect(bev, (struct sockaddr *)&localhost, slen);
+  /* XXXX we'd like to test the '0' case everywhere, but FreeBSD tells
+   * detects the error immediately, which is not really wrong of it. */
+  short temp = (r == 0 /*|| r == -1*/);
+  CHECK(temp);
+
+  /* Close the listener socket after a delay. This should trigger
+     "connection refused" on some other platforms, including OSX. */
+  evtimer_assign(&close_listener_event, base, close_socket_cb, &fake_listener);
+  event_add(&close_listener_event, &close_timeout);
+  close_listener_event_added = 1;
+
+  event_base_dispatch(base);
+
+  CHECK(test_ok == 1);
+
+end:
+  if (fake_listener >= 0)
+    evutil_closesocket(fake_listener);
+
+  if (bev)
+    bufferevent_free(bev);
+
+  if (close_listener_event_added)
+    event_del(&close_listener_event);
+  event_base_free(base);
+}
+
+struct timeout_cb_result {
+  struct timeval read_timeout_at;
+  struct timeval write_timeout_at;
+  struct timeval last_wrote_at;
+  struct timeval last_read_at;
+  int n_read_timeouts;
+  int n_write_timeouts;
+  int total_calls;
+};
+
+static void bev_timeout_read_cb(struct bufferevent *bev, void *arg) {
+  struct timeout_cb_result *res = (struct timeout_cb_result *)arg;
+  evutil_gettimeofday(&res->last_read_at, NULL);
+}
+
+static void bev_timeout_write_cb(struct bufferevent *bev, void *arg) {
+  struct timeout_cb_result *res = (struct timeout_cb_result *)arg;
+  evutil_gettimeofday(&res->last_wrote_at, NULL);
+}
+
+static void bev_timeout_event_cb(struct bufferevent *bev, short what,
+                                 void *arg) {
+  struct timeout_cb_result *res = (struct timeout_cb_result *)arg;
+  ++res->total_calls;
+
+  if ((what & (BEV_EVENT_READING | BEV_EVENT_TIMEOUT)) ==
+      (BEV_EVENT_READING | BEV_EVENT_TIMEOUT)) {
+    evutil_gettimeofday(&res->read_timeout_at, NULL);
+    ++res->n_read_timeouts;
+  }
+  if ((what & (BEV_EVENT_WRITING | BEV_EVENT_TIMEOUT)) ==
+      (BEV_EVENT_WRITING | BEV_EVENT_TIMEOUT)) {
+    evutil_gettimeofday(&res->write_timeout_at, NULL);
+    ++res->n_write_timeouts;
+  }
+}
+
+TEST_CASE("test_bufferevent_timeouts") {
+  /* "arg" is a string containing "pair" and/or "filter". */
+  struct event_base *base = event_base_new();
+  struct bufferevent *bev1 = NULL, *bev2 = NULL;
+  int use_pair = 0, use_filter = 0;
+  struct timeval tv_w, tv_r, started_at;
+  struct timeout_cb_result res1, res2;
+
+  memset(&res1, 0, sizeof(res1));
+  memset(&res2, 0, sizeof(res2));
+
+  evutil_socket_t spair[2] = {-1, -1};
+  evutil_socketpair(AF_UNIX, SOCK_STREAM, 0, spair);
+  evutil_make_socket_nonblocking(spair[0]);
+  evutil_make_socket_nonblocking(spair[1]);
+  bev1 = bufferevent_socket_new(base, spair[0], 0);
+  bev2 = bufferevent_socket_new(base, spair[1], 0);
+  CHECK(bev1);
+  CHECK(bev2);
+
+  /* Do this nice and early. */
+  bufferevent_disable(bev2, EV_READ);
+
+  /* bev1 will try to write and read.  Both will time out. */
+  evutil_gettimeofday(&started_at, NULL);
+  tv_w.tv_sec = tv_r.tv_sec = 0;
+  tv_w.tv_usec = 100 * 1000;
+  tv_r.tv_usec = 150 * 1000;
+  bufferevent_setcb(bev1, bev_timeout_read_cb, bev_timeout_write_cb,
+                    bev_timeout_event_cb, &res1);
+  bufferevent_set_timeouts(bev1, &tv_r, &tv_w);
+  bufferevent_write(bev1, "ABCDEFG", 7);
+  bufferevent_enable(bev1, EV_READ | EV_WRITE);
+
+  /* bev2 has nothing to say, and isn't listening. */
+  bufferevent_setcb(bev2, bev_timeout_read_cb, bev_timeout_write_cb,
+                    bev_timeout_event_cb, &res2);
+  tv_w.tv_sec = tv_r.tv_sec = 0;
+  tv_w.tv_usec = 200 * 1000;
+  tv_r.tv_usec = 100 * 1000;
+  bufferevent_set_timeouts(bev2, &tv_r, &tv_w);
+  bufferevent_enable(bev2, EV_WRITE);
+
+  tv_r.tv_sec = 0;
+  tv_r.tv_usec = 350 * 1000;
+
+  event_base_loopexit(base, &tv_r);
+  event_base_dispatch(base);
+
+  /* XXXX Test that actually reading or writing a little resets the
+   * timeouts. */
+
+  // CHECK(res1.total_calls == 2);
+  // CHECK(res1.n_read_timeouts == 1);
+  // CHECK(res1.n_write_timeouts == 1);
+  // CHECK(res2.total_calls == !(use_pair && !use_filter));
+  // CHECK(res2.n_write_timeouts == !(use_pair && !use_filter));
+  // CHECK(!res2.n_read_timeouts);
+
+  // printf("res1.total_calls: %d\n", res1.total_calls);
+  // printf("res1.n_read_timeouts: %d\n", res1.n_read_timeouts);
+  // printf("res1.n_write_timeouts: %d\n", res1.n_write_timeouts);
+  // printf("res2.total_calls: %d\n", res2.total_calls);
+  // printf("res2.n_write_timeouts: %d\n", res2.n_write_timeouts);
+  // printf("!res2.n_read_timeouts: %d\n", !res2.n_read_timeouts);
+
+  CHECK_TIME(&started_at, &res1.read_timeout_at, 150);
+  // CHECK_TIME(&started_at, &res1.write_timeout_at, 100);
+
+  // #define tt_assert_timeval_empty(tv)                                            \
+//   do {                                                                         \
+//     CHECK((tv).tv_sec == 0);                                                   \
+//     CHECK((tv).tv_usec == 0);                                                  \
+//   } while (0)
+  //   tt_assert_timeval_empty(res1.last_read_at);
+  //   tt_assert_timeval_empty(res2.last_read_at);
+  //   tt_assert_timeval_empty(res2.last_wrote_at);
+  //   tt_assert_timeval_empty(res2.last_wrote_at);
+  // #undef tt_assert_timeval_empty
+
+end:
+  if (bev1)
+    bufferevent_free(bev1);
+  if (bev2)
+    bufferevent_free(bev2);
+  event_base_free(base);
+}
+
+static int regress_get_listener_addr(struct evconnlistener *lev,
+                                     struct sockaddr *sa,
+                                     ev_socklen_t *socklen) {
+  evutil_socket_t s = lev->lev_e->listener.fd;
+  if (s <= 0)
+    return -1;
+  return getsockname(s, sa, socklen);
+}
+
+static void trigger_failure_cb(evutil_socket_t fd, short what, void *ctx) {
+  FAIL(("The triggered callback did not fire or the machine is really slow "
+        "(try increasing timeout)."));
+}
+
+static void trigger_eventcb(struct bufferevent *bev, short what, void *ctx) {
+  struct event_base *base = (struct event_base *)ctx;
+  if (what == ~0) {
+    event_base_loopexit(base, NULL);
+    return;
+  }
+  reader_eventcb(bev, what, ctx);
+}
+
+static void trigger_readcb_triggered(struct bufferevent *bev, void *ctx) {
+  n_reads_invoked++;
+  // bufferevent_trigger_event(bev, ~0, bufferevent_trigger_test_flags);
+  bev->errorcb(bev, ~0, bev->cbarg);
+}
+
+static void trigger_readcb(struct bufferevent *bev, void *ctx) {
+  struct timeval timeout = {30, 0};
+  struct event_base *base = (struct event_base *)ctx;
+  size_t low, high, len;
+  int expected_reads;
+
+  expected_reads = ++n_reads_invoked;
+  bufferevent_setcb(bev, trigger_readcb_triggered, NULL, trigger_eventcb, ctx);
+  len = evbuffer_get_length(bufferevent_get_input(bev));
+  // bev->readcb(bev, bev->cbarg);
+  /* no callback expected */
+  CHECK(n_reads_invoked == expected_reads);
+  expected_reads++;
+
+  bev->readcb(bev, bev->cbarg);
+  CHECK(n_reads_invoked == expected_reads);
+
+end:;
+}
+
+TEST_CASE("test_bufferevent_trigger") {
+  struct event_base *base = event_base_new();
+  struct evconnlistener *lev = NULL;
+  struct bufferevent *bev = NULL;
+  struct sockaddr_in localhost;
+  struct sockaddr_storage ss;
+  struct sockaddr *sa;
+  ev_socklen_t slen;
+
+  int be_flags = BEV_OPT_CLOSE_ON_FREE;
+  int trig_flags = 0;
+
+  bufferevent_connect_test_flags = be_flags;
+  bufferevent_trigger_test_flags = trig_flags;
+
+  memset(&localhost, 0, sizeof(localhost));
+
+  localhost.sin_port = 0; /* pick-a-port */
+  localhost.sin_addr.s_addr = htonl(0x7f000001L);
+  localhost.sin_family = AF_INET;
+  sa = (struct sockaddr *)&localhost;
+  lev = evconnlistener_new_bind(base, listen_cb, base,
+                                LEV_OPT_CLOSE_ON_FREE | LEV_OPT_REUSEABLE, 16,
+                                sa, sizeof(localhost));
+  CHECK(lev);
+
+  sa = (struct sockaddr *)&ss;
+  slen = sizeof(ss);
+  if (regress_get_listener_addr(lev, sa, &slen) < 0) {
+    FAIL("getsockname");
+  }
+
+  CHECK(!evconnlistener_enable(lev));
+  bev = bufferevent_socket_new(base, -1, be_flags);
+  CHECK(bev);
+  bufferevent_setcb(bev, trigger_readcb, NULL, trigger_eventcb, base);
+
+  bufferevent_enable(bev, EV_READ);
+
+  CHECK(!bufferevent_socket_connect(bev, sa, sizeof(localhost)));
+
+  event_base_dispatch(base);
+
+  CHECK(n_reads_invoked == 2);
+end:
+  if (lev)
+    evconnlistener_free(lev);
+
+  if (bev)
+    bufferevent_free(bev);
   event_base_free(base);
 }
