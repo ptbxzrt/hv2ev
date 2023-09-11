@@ -830,8 +830,10 @@ end:
 
 static int n_strings_read = 0;
 static int n_reads_invoked = 0;
+static int bufferevent_connect_test_flags = 0;
 
 static void sender_writecb(struct bufferevent *bev, void *ctx) {
+  printf("sender_writecb\n");
   if (evbuffer_get_length(bufferevent_get_output(bev)) == 0) {
     bufferevent_disable(bev, EV_READ | EV_WRITE);
     bufferevent_free(bev);
@@ -844,6 +846,7 @@ static void sender_errorcb(struct bufferevent *bev, short what, void *ctx) {
 
 static void listen_cb(struct evconnlistener *listener, evutil_socket_t fd,
                       struct sockaddr *sa, int socklen, void *arg) {
+  printf("listen_cb\n");
   struct event_base *base = (struct event_base *)arg;
   struct bufferevent *bev;
   const char s[] = TEST_STR;
@@ -855,20 +858,25 @@ end:;
 }
 
 static void reader_readcb(struct bufferevent *bev, void *ctx) {
+  printf("reader_readcb\n");
   n_reads_invoked++;
 }
 
 static void reader_eventcb(struct bufferevent *bev, short what, void *ctx) {
+  printf("reader_eventcb\n");
   struct event_base *base = (struct event_base *)ctx;
   if (what & BEV_EVENT_ERROR) {
+    printf("BEV_EVENT_ERROR\n");
     perror("foobar");
     FAIL(("got connector error %d", (int)what));
     return;
   }
   if (what & BEV_EVENT_CONNECTED) {
+    printf("BEV_EVENT_CONNECTED\n");
     bufferevent_enable(bev, EV_READ);
   }
   if (what & BEV_EVENT_EOF) {
+    printf("BEV_EVENT_EOF\n");
     char buf[512];
     size_t n;
     n = bufferevent_read(bev, buf, sizeof(buf) - 1);
@@ -880,8 +888,6 @@ static void reader_eventcb(struct bufferevent *bev, short what, void *ctx) {
   }
 end:;
 }
-
-static int bufferevent_connect_test_flags = 0;
 
 TEST_CASE("test_bufferevent_connect") {
   struct event_base *base = event_base_new();

@@ -265,8 +265,10 @@ int evbuffer_drain(struct evbuffer *buf, size_t len) {
       evbuffer_chain_free(chain);
     }
     buf->first = chain;
-    chain->misalign += remain_to_delete;
-    chain->off -= remain_to_delete;
+    if (chain != NULL) {
+      chain->misalign += remain_to_delete;
+      chain->off -= remain_to_delete;
+    }
   }
   return 0;
 }
@@ -433,6 +435,39 @@ int evbuffer_add_reference(struct evbuffer *buf, const void *data,
   return 0;
 }
 
+int evbuffer_remove(struct evbuffer *buf, void *data_out, size_t datalen) {
+  struct evbuffer_chain *chain;
+  char *data = (char *)data_out;
+  size_t nread;
+  ssize_t result = 0;
+
+  chain = buf->first;
+  if (datalen > buf->total_len)
+    datalen = buf->total_len;
+  if (datalen == 0) {
+    return result;
+  }
+
+  nread = datalen;
+
+  while (datalen && datalen >= chain->off) {
+    size_t copylen = chain->off;
+    memcpy(data, chain->buf.base + chain->misalign, copylen);
+    data += copylen;
+    datalen -= copylen;
+    chain = chain->next;
+  }
+  if (datalen) {
+    memcpy(data, chain->buf.base + chain->misalign, datalen);
+  }
+
+  result = nread;
+  if (result > 0) {
+    evbuffer_drain(buf, result);
+  }
+  return result;
+}
+
 int event_assign(struct event *ev, struct event_base *base, evutil_socket_t fd,
                  short events, event_callback_fn callback, void *callback_arg);
 int event_del(struct event *ev);
@@ -474,6 +509,24 @@ static void bufferevent_readcb(evutil_socket_t fd, short event, void *arg) {
   evbuffer_expand(buffer, n);
   unsigned char *buf = evbuffer_pullup(buffer, n);
   size_t nread = read(fd, buf, n);
+  if (nread <= 0) {
+    short what = BEV_EVENT_READING;
+    if (nread == 0) {
+      what |= BEV_EVENT_EOF;
+    } else {
+      int err = evutil_socket_geterror(fd);
+      if (EVUTIL_ERR_RW_RETRIABLE(err))
+        return;
+      if (EVUTIL_ERR_CONNECT_REFUSED(err)) {
+        bufev->connection_refused = 1;
+        return;
+      }
+      what |= BEV_EVENT_ERROR;
+    }
+    bufferevent_disable(bufev, EV_READ);
+    bufev->errorcb(bufev, what, bufev->cbarg);
+    return;
+  }
   buffer->first->off += nread;
 
   bufev->readcb(bufev, bufev->cbarg);
@@ -538,6 +591,23 @@ static void bufferevent_writecb(evutil_socket_t fd, short event, void *arg) {
   size_t n = buffer->total_len;
   unsigned char *buf = evbuffer_pullup(buffer, n);
   size_t nwrite = write(fd, buf, n);
+  if (nwrite <= 0) {
+    if (nwrite == 0) {
+      what |= BEV_EVENT_EOF;
+    } else {
+      int err = evutil_socket_geterror(fd);
+      if (EVUTIL_ERR_RW_RETRIABLE(err)) {
+        if (evbuffer_get_length(bufev->output) == 0) {
+          event_del(&bufev->ev_write);
+        }
+        return;
+      }
+      what |= BEV_EVENT_ERROR;
+    }
+    bufferevent_disable(bufev, EV_WRITE);
+    bufev->errorcb(bufev, what, bufev->cbarg);
+    return;
+  }
   evbuffer_drain(buffer, nwrite);
 
   if (evbuffer_get_length(buffer) == 0) {
@@ -577,7 +647,7 @@ struct bufferevent *bufferevent_socket_new(struct event_base *base,
   bufev->cbarg = NULL;
   timerclear(&(bufev->timeout_read));
   timerclear(&(bufev->timeout_write));
-  bufev->enabled = 0;
+  bufev->enabled = EV_WRITE;
   bufev->connecting = 0;
   bufev->connection_refused = 0;
   bufev->options = options;
@@ -1220,7 +1290,9 @@ int event_add(struct event *ev, const struct timeval *tv) {
   if (tv != NULL) {
     ev->timeout = timeval_to_ms(tv);
     ev->timer = htimer_add(base->loop, on_timeout, ev->timeout, INFINITE);
-    hevent_set_userdata(ev->timer, ev);
+    if (ev->timer != NULL) {
+      hevent_set_userdata(ev->timer, ev);
+    }
   }
   return 0;
 }

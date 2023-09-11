@@ -26,6 +26,7 @@
 #define evutil_socket_geterror(sock) (errno)
 #define EVUTIL_ERR_CONNECT_RETRIABLE(e) ((e) == EINTR || (e) == EINPROGRESS)
 #define EVUTIL_ERR_CONNECT_REFUSED(e) ((e) == ECONNREFUSED)
+#define EVUTIL_ERR_RW_RETRIABLE(e) ((e) == EINTR || EVUTIL_ERR_IS_EAGAIN(e))
 #define EVUTIL_SET_SOCKET_ERROR(errcode)                                       \
   do {                                                                         \
     errno = (errcode);                                                         \
@@ -101,6 +102,8 @@ struct evdns_base {
 typedef void (*evconnlistener_cb)(struct evconnlistener *, evutil_socket_t,
                                   struct sockaddr *, int socklen, void *);
 typedef void (*evconnlistener_errorcb)(struct evconnlistener *, void *);
+
+struct evconnlistener_event;
 
 struct evconnlistener {
   evconnlistener_event *lev_e;
