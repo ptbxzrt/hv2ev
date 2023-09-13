@@ -319,5 +319,6 @@ ev_token_bucket_cfg_new(size_t read_rate, size_t read_burst, size_t write_rate,
 #define evsignal_add(ev, tv) event_add((ev), (tv))
 int bufferevent_set_rate_limit(struct bufferevent *bev,
                                struct ev_token_bucket_cfg *cfg);
+int event_base_gettimeofday_cached(struct event_base *base, struct timeval *tv);
 
 #endif
