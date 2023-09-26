@@ -512,6 +512,9 @@ static void bufferevent_readcb(evutil_socket_t fd, short event, void *arg) {
 
   size_t n = EVBUFFER_MAX_READ;
   ioctl(fd, FIONREAD, &n);
+  if (n <= 0) {
+    n = 1;
+  }
 
   char *new_buf = NULL;
   HV_ALLOC(new_buf, n);
@@ -624,10 +627,10 @@ static void bufferevent_writecb(evutil_socket_t fd, short event, void *arg) {
   }
 
   if (evbuffer_get_length(buffer) == 0) {
+    event_del(&(bufev->ev_write));
     if (bufev->writecb) {
       bufev->writecb(bufev, bufev->cbarg);
     }
-    event_del(&(bufev->ev_write));
   }
 }
 
@@ -689,7 +692,7 @@ void bufferevent_free(struct bufferevent *bufev) {
 
 int bufferevent_write_buffer(struct bufferevent *bufev, struct evbuffer *buf) {
   evbuffer_add_buffer(bufev->output, buf);
-  if (evbuffer_get_length(buf) > 0) {
+  if (evbuffer_get_length(bufev->output) > 0) {
     event_add(&(bufev->ev_write), &(bufev->timeout_write));
   }
   // bufev->enabled |= EV_WRITE;
@@ -1180,9 +1183,16 @@ HV_INLINE int event_base_loopexit(struct event_base *base,
 }
 
 HV_INLINE void on_readable(hio_t *io) {
-  struct event *ev = (struct event *)hevent_userdata(io);
+  struct event *ev = (struct event *)hio_getcb_read(io);
+  if (ev == NULL) {
+    return;
+  }
   int fd = hio_fd(io);
   short events = ev->events;
+  short revents = hio_revents(io);
+  if (!((events & EV_READ) && (revents & EV_READ))) {
+    return;
+  }
 
   if (!(events & EV_PERSIST)) {
     hio_del(io, HV_READ);
@@ -1204,9 +1214,16 @@ HV_INLINE void on_readable(hio_t *io) {
 }
 
 HV_INLINE void on_writable(hio_t *io) {
-  struct event *ev = (struct event *)hevent_userdata(io);
+  struct event *ev = (struct event *)hio_getcb_write(io);
+  if (ev == NULL) {
+    return;
+  }
   int fd = hio_fd(io);
   short events = ev->events;
+  short revents = hio_revents(io);
+  if (!((events & EV_WRITE) && (revents & EV_WRITE))) {
+    return;
+  }
 
   if (!(events & EV_PERSIST)) {
     hio_del(io, HV_WRITE);
@@ -1224,6 +1241,16 @@ HV_INLINE void on_writable(hio_t *io) {
 
   if ((ev->timer != NULL) && (events & EV_PERSIST)) {
     htimer_reset(ev->timer, ev->timeout);
+  }
+}
+
+void on_netio(hio_t *io) {
+  short revents = hio_revents(io);
+  if (revents & EV_WRITE) {
+    on_writable(io);
+  }
+  if (revents & EV_READ) {
+    on_readable(io);
   }
 }
 
@@ -1302,12 +1329,14 @@ int event_add(struct event *ev, const struct timeval *tv) {
   short events = ev->events;
   if (fd >= 0) {
     ev->io = hio_get(base->loop, fd);
-    hevent_set_userdata(ev->io, ev);
+    // hevent_set_userdata(ev->io, ev);
     if (events & EV_READ) {
-      hio_add(ev->io, on_readable, HV_READ);
+      hio_setcb_read(ev->io, (hread_cb)ev);
+      hio_add(ev->io, on_netio, HV_READ);
     }
     if (events & EV_WRITE) {
-      hio_add(ev->io, on_writable, HV_WRITE);
+      hio_setcb_write(ev->io, (hwrite_cb)ev);
+      hio_add(ev->io, on_netio, HV_WRITE);
     }
   }
   if (tv != NULL) {
@@ -1340,9 +1369,11 @@ int event_del(struct event *ev) {
     short events = ev->events;
     if (events & EV_READ) {
       hio_del(ev->io, HV_READ);
+      hio_setcb_read(ev->io, NULL);
     }
     if (events & EV_WRITE) {
       hio_del(ev->io, HV_WRITE);
+      hio_setcb_write(ev->io, NULL);
     }
   }
   if (ev->timer != NULL) {

@@ -476,6 +476,9 @@ static void bufferevent_readcb(evutil_socket_t fd, short event, void *arg) {
 
   size_t n = EVBUFFER_MAX_READ;
   ioctl(fd, FIONREAD, &n);
+  if (n <= 0) {
+    n = 1;
+  }
 
   char *new_buf = NULL;
   HV_ALLOC(new_buf, n);
@@ -525,7 +528,9 @@ int evutil_socket_finished_connecting(evutil_socket_t fd) {
 }
 
 static void bufferevent_writecb(evutil_socket_t fd, short event, void *arg) {
+  printf("进入bufferevent_writecb fd: %d\n", fd);
   struct bufferevent *bufev = (struct bufferevent *)arg;
+  printf("ev_write pending: %d\n", bufev->ev_write.events_pending);
   short what = BEV_EVENT_WRITING;
 
   if (event == EV_TIMEOUT) {
@@ -588,11 +593,12 @@ static void bufferevent_writecb(evutil_socket_t fd, short event, void *arg) {
   }
 
   if (evbuffer_get_length(buffer) == 0) {
+    event_del(&(bufev->ev_write));
     if (bufev->writecb) {
       bufev->writecb(bufev, bufev->cbarg);
     }
-    event_del(&(bufev->ev_write));
   }
+  printf("退出bufferevent_writecb\n");
 }
 
 static void bufferevent_errcb(evutil_socket_t fd, short what, void *arg) {
@@ -653,7 +659,8 @@ void bufferevent_free(struct bufferevent *bufev) {
 
 int bufferevent_write_buffer(struct bufferevent *bufev, struct evbuffer *buf) {
   evbuffer_add_buffer(bufev->output, buf);
-  if (evbuffer_get_length(buf) > 0) {
+  if (evbuffer_get_length(bufev->output) > 0) {
+    printf("bufferevent_write_buffer\n");
     event_add(&(bufev->ev_write), &(bufev->timeout_write));
   }
   // bufev->enabled |= EV_WRITE;
@@ -1138,10 +1145,17 @@ int event_base_loopexit(struct event_base *base, const struct timeval *tv) {
   return 0;
 }
 
-void on_readable(hio_t *io) {
-  struct event *ev = (struct event *)hevent_userdata(io);
+HV_INLINE void on_readable(hio_t *io) {
+  struct event *ev = (struct event *)hio_getcb_read(io);
+  if (ev == NULL) {
+    return;
+  }
   int fd = hio_fd(io);
   short events = ev->events;
+  short revents = hio_revents(io);
+  if (!((events & EV_READ) && (revents & EV_READ))) {
+    return;
+  }
 
   if (!(events & EV_PERSIST)) {
     hio_del(io, HV_READ);
@@ -1162,10 +1176,17 @@ void on_readable(hio_t *io) {
   }
 }
 
-void on_writable(hio_t *io) {
-  struct event *ev = (struct event *)hevent_userdata(io);
+HV_INLINE void on_writable(hio_t *io) {
+  struct event *ev = (struct event *)hio_getcb_write(io);
+  if (ev == NULL) {
+    return;
+  }
   int fd = hio_fd(io);
   short events = ev->events;
+  short revents = hio_revents(io);
+  if (!((events & EV_WRITE) && (revents & EV_WRITE))) {
+    return;
+  }
 
   if (!(events & EV_PERSIST)) {
     hio_del(io, HV_WRITE);
@@ -1183,6 +1204,16 @@ void on_writable(hio_t *io) {
 
   if ((ev->timer != NULL) && (events & EV_PERSIST)) {
     htimer_reset(ev->timer, ev->timeout);
+  }
+}
+
+void on_netio(hio_t *io) {
+  short revents = hio_revents(io);
+  if (revents & EV_WRITE) {
+    on_writable(io);
+  }
+  if (revents & EV_READ) {
+    on_readable(io);
   }
 }
 
@@ -1255,18 +1286,21 @@ struct event *event_new(struct event_base *base, evutil_socket_t fd,
 }
 
 int event_add(struct event *ev, const struct timeval *tv) {
+  printf("进入event_add, events: %d\n", ev->events);
   int fd = ev->fd;
   struct event_base *base = ev->base;
   short events = ev->events;
   ev->events_pending |= events;
   if (fd >= 0) {
     ev->io = hio_get(base->loop, fd);
-    hevent_set_userdata(ev->io, ev);
+    // hevent_set_userdata(ev->io, ev);
     if (events & EV_READ) {
-      hio_add(ev->io, on_readable, HV_READ);
+      hio_setcb_read(ev->io, (hread_cb)ev);
+      hio_add(ev->io, on_netio, HV_READ);
     }
     if (events & EV_WRITE) {
-      hio_add(ev->io, on_writable, HV_WRITE);
+      hio_setcb_write(ev->io, (hwrite_cb)ev);
+      hio_add(ev->io, on_netio, HV_WRITE);
     }
   }
   if (tv != NULL) {
@@ -1280,6 +1314,7 @@ int event_add(struct event *ev, const struct timeval *tv) {
       hevent_set_userdata(ev->timer, ev);
     }
   }
+  printf("退出event_add\n");
   return 0;
 }
 
@@ -1295,20 +1330,24 @@ void event_active(struct event *ev, int res, short ncalls) {
 }
 
 int event_del(struct event *ev) {
+  printf("进入event_del, events: %d\n", ev->events);
   ev->events_pending &= (~ev->events);
   if (ev->io != NULL) {
     short events = ev->events;
     if (events & EV_READ) {
       hio_del(ev->io, HV_READ);
+      hio_setcb_read(ev->io, NULL);
     }
     if (events & EV_WRITE) {
       hio_del(ev->io, HV_WRITE);
+      hio_setcb_write(ev->io, NULL);
     }
   }
   if (ev->timer != NULL) {
     htimer_del(ev->timer);
     ev->timer = NULL;
   }
+  printf("退出event_del\n");
   return 0;
 }
 
@@ -1360,41 +1399,34 @@ evutil_socket_t evconnlistener_get_fd(struct evconnlistener *lev) {
   return lev->lev_e->listener.fd;
 }
 
-void
-ev_token_bucket_cfg_free(struct ev_token_bucket_cfg *cfg)
-{
-	free(cfg);
-}
+void ev_token_bucket_cfg_free(struct ev_token_bucket_cfg *cfg) { free(cfg); }
 
 struct ev_token_bucket_cfg *
-ev_token_bucket_cfg_new(size_t read_rate, size_t read_burst,
-    size_t write_rate, size_t write_burst,
-    const struct timeval *tick_len)
-{
-	struct ev_token_bucket_cfg *r;
-	struct timeval g;
-	if (! tick_len) {
-		g.tv_sec = 1;
-		g.tv_usec = 0;
-		tick_len = &g;
-	}
-	if (read_rate > read_burst || write_rate > write_burst ||
-	    read_rate < 1 || write_rate < 1)
-		return NULL;
-	if (read_rate > EV_RATE_LIMIT_MAX ||
-	    write_rate > EV_RATE_LIMIT_MAX ||
-	    read_burst > EV_RATE_LIMIT_MAX ||
-	    write_burst > EV_RATE_LIMIT_MAX)
-		return NULL;
-	HV_ALLOC(r, sizeof(struct ev_token_bucket_cfg));
-	if (!r)
-		return NULL;
-	r->read_rate = read_rate;
-	r->write_rate = write_rate;
-	r->read_maximum = read_burst;
-	r->write_maximum = write_burst;
-	memcpy(&r->tick_timeout, tick_len, sizeof(struct timeval));
-	r->msec_per_tick = (tick_len->tv_sec * 1000) +
-	    (tick_len->tv_usec & COMMON_TIMEOUT_MICROSECONDS_MASK)/1000;
-	return r;
+ev_token_bucket_cfg_new(size_t read_rate, size_t read_burst, size_t write_rate,
+                        size_t write_burst, const struct timeval *tick_len) {
+  struct ev_token_bucket_cfg *r;
+  struct timeval g;
+  if (!tick_len) {
+    g.tv_sec = 1;
+    g.tv_usec = 0;
+    tick_len = &g;
+  }
+  if (read_rate > read_burst || write_rate > write_burst || read_rate < 1 ||
+      write_rate < 1)
+    return NULL;
+  if (read_rate > EV_RATE_LIMIT_MAX || write_rate > EV_RATE_LIMIT_MAX ||
+      read_burst > EV_RATE_LIMIT_MAX || write_burst > EV_RATE_LIMIT_MAX)
+    return NULL;
+  HV_ALLOC(r, sizeof(struct ev_token_bucket_cfg));
+  if (!r)
+    return NULL;
+  r->read_rate = read_rate;
+  r->write_rate = write_rate;
+  r->read_maximum = read_burst;
+  r->write_maximum = write_burst;
+  memcpy(&r->tick_timeout, tick_len, sizeof(struct timeval));
+  r->msec_per_tick =
+      (tick_len->tv_sec * 1000) +
+      (tick_len->tv_usec & COMMON_TIMEOUT_MICROSECONDS_MASK) / 1000;
+  return r;
 }
