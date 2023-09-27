@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.10)
 
-add_executable(test test_main.cpp test1.cpp)
+add_executable(test ../hv2ev.c test_main.cpp test1.cpp)
 
 set(hv_DIR "/home/ptbxzrt/third_party/libhv")
 
