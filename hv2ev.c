@@ -1184,7 +1184,7 @@ static void sig_event_cb(int fd, short awakened_events_on_epoll, void *arg) {
 struct event_base *event_base_new(void) {
   struct event_base *base = NULL;
   HV_ALLOC(base, sizeof(struct event_base));
-  base->loop = hloop_new(HLOOP_FLAG_RUN_ONCE);
+  base->loop = hloop_new(HLOOP_FLAG_QUIT_WHEN_NO_ACTIVE_EVENTS);
   base->timer = NULL;
   base->enable_signal = 0;
 
