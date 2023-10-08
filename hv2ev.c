@@ -1084,11 +1084,110 @@ int evconnlistener_enable(struct evconnlistener *lev) {
   return r;
 }
 
+#define queue_data(ptr, type, field)                                           \
+  ((type *)((char *)(ptr)-offsetof(type, field)))
+
+void queue_node_reset(struct queue_node *queue_node) {
+  queue_node->next = queue_node;
+  queue_node->pre = queue_node;
+}
+
+int queue_node_empty(struct queue_node *queue_node) {
+  return queue_node->next == queue_node;
+}
+
+void queue_node_insert_tail(struct queue_node *head, struct queue_node *node) {
+  node->next = head;
+  node->pre = head->pre;
+  node->pre->next = node;
+  head->pre = node;
+}
+
+void queue_node_remove(struct queue_node *node) {
+  node->pre->next = node->next;
+  node->next->pre = node->pre;
+}
+
+void run_signal_cb(hevent_t *hevent) {
+  printf("进入run_signal_cb\n");
+  struct event_base *base = (struct event_base *)hevent->userdata;
+  struct queue_node *head = &(base->awaken_signal_events_head);
+  if (base->enable_signal && !queue_node_empty(head)) {
+    struct queue_node *ev_node = head->next;
+    while (ev_node != head) {
+      struct event *ev =
+          queue_data(ev_node, struct event, self_awaken_signal_node);
+      for (int i = 0; i < ev->num_calls; i++) {
+        ev->callback(ev->fd, EV_SIGNAL, ev->callback_arg);
+      }
+      struct queue_node *next = ev_node->next;
+      queue_node_remove(ev_node);
+      ev_node = next;
+    }
+  }
+  printf("退出run_signal_cb\n");
+}
+
+static void sig_event_cb(int fd, short awakened_events_on_epoll, void *arg) {
+  printf("进入sig_event_cb\n");
+  char signals[1024];
+  int n = 0;
+  int ncaught[NSIG];
+  memset(signals, 0, sizeof(signals));
+  memset(ncaught, 0, sizeof(ncaught));
+
+  struct event_base *base = (struct event_base *)arg;
+
+  if (base == NULL) {
+    return;
+  }
+
+  while (true) {
+    n = read(fd, signals, sizeof(signals));
+    if (n <= 0) {
+      break;
+    }
+    for (int i = 0; i < n; ++i) {
+      char sig = signals[i];
+      if (sig < NSIG)
+        ncaught[sig]++;
+    }
+  }
+
+  for (int i = 0; i < NSIG; i++) {
+    if (ncaught[i] > 0) {
+      struct queue_node *events_at_sig = &(base->signal_events_head[i]);
+      if (!queue_node_empty(events_at_sig)) {
+        struct queue_node *ev_node = events_at_sig->next;
+        while (ev_node != events_at_sig) {
+          struct event *ev =
+              queue_data(ev_node, struct event, self_signal_node);
+          // ev->awakened_events_ |= EV_SIGNAL;
+          ev->num_calls = ncaught[i];
+          queue_node_insert_tail(&(base->awaken_signal_events_head),
+                                 &(ev->self_awaken_signal_node));
+          ev_node = ev_node->next;
+        }
+      }
+    }
+  }
+
+  hevent_t hev;
+  memset(&hev, 0, sizeof(hev));
+  hev.cb = run_signal_cb;
+  hev.userdata = base;
+  hloop_post_event(base->loop, &hev);
+
+  printf("退出sig_event_cb\n");
+}
+
 struct event_base *event_base_new(void) {
   struct event_base *base = NULL;
   HV_ALLOC(base, sizeof(struct event_base));
-  base->loop = hloop_new(HLOOP_FLAG_QUIT_WHEN_NO_ACTIVE_EVENTS);
+  base->loop = hloop_new(HLOOP_FLAG_RUN_ONCE);
   base->timer = NULL;
+  base->enable_signal = 0;
+
   return base;
 }
 
@@ -1209,6 +1308,7 @@ HV_INLINE void on_writable(hio_t *io) {
 }
 
 void on_netio(hio_t *io) {
+  printf("on_netio\n");
   short revents = hio_revents(io);
   if (revents & EV_WRITE) {
     on_writable(io);
@@ -1283,7 +1383,24 @@ struct event *event_new(struct event_base *base, evutil_socket_t fd,
   ev->events_pending = 0;
   ev->callback = callback;
   ev->callback_arg = callback_arg;
+  ev->num_calls = 0;
+  queue_node_reset(&(ev->self_signal_node));
+  queue_node_reset(&(ev->self_awaken_signal_node));
   return ev;
+}
+
+static int sig_write_fd = -1;
+
+static void sig_handler(int sig) {
+  printf("进入sig_handler\n");
+  int save_errno = errno;
+
+  char signum = (char)sig;
+  int n = write(sig_write_fd, &signum, 1);
+  printf("写入%d个信号\n", n);
+
+  errno = save_errno;
+  printf("退出sig_handler\n");
 }
 
 int event_add(struct event *ev, const struct timeval *tv) {
@@ -1291,11 +1408,46 @@ int event_add(struct event *ev, const struct timeval *tv) {
   int fd = ev->fd;
   struct event_base *base = ev->base;
   short events = ev->events;
+  if (ev->events & EV_SIGNAL) {
+    printf("添加信号事件\n");
+    if (base->enable_signal == 0) {
+      printf("启动信号\n");
+      base->enable_signal = 1;
+      for (int i = 0; i < NSIG; i++) {
+        queue_node_reset(&(base->signal_events_head[i]));
+      }
+      queue_node_reset(&(base->awaken_signal_events_head));
+      socketpair(AF_UNIX, SOCK_STREAM, 0, base->pair);
+      fcntl(base->pair[0], F_SETFL, O_NONBLOCK);
+      fcntl(base->pair[1], F_SETFL, O_NONBLOCK);
+      fcntl(base->pair[0], F_SETFD, FD_CLOEXEC);
+      fcntl(base->pair[1], F_SETFD, FD_CLOEXEC);
+      event_assign(&(base->signal_monitor), base, base->pair[0],
+                   EV_READ | EV_PERSIST, sig_event_cb, base);
+      event_add(&(base->signal_monitor), NULL);
+    }
+    assert(fd >= 0 && fd < NSIG);
+    struct queue_node *events_at_sig = &(base->signal_events_head[fd]);
+    if (queue_node_empty(events_at_sig)) {
+      struct sigaction sa;
+      memset(&sa, 0, sizeof(sa));
+      sa.sa_handler = sig_handler;
+      sa.sa_flags |= SA_RESTART;
+      sigfillset(&sa.sa_mask);
+      sig_write_fd = base->pair[1];
+      sigaction(fd, &sa, NULL);
+    }
+    queue_node_insert_tail(&(base->signal_events_head[fd]),
+                           &(ev->self_signal_node));
+    return 0;
+  }
   ev->events_pending |= events;
   if (fd >= 0) {
     ev->io = hio_get(base->loop, fd);
     // hevent_set_userdata(ev->io, ev);
     if (events & EV_READ) {
+      printf("监听读端%d\n", ev->fd);
+      printf("监视的事件%d\n", ev->events);
       hio_setcb_read(ev->io, (hread_cb)ev);
       hio_add(ev->io, on_netio, HV_READ);
     }

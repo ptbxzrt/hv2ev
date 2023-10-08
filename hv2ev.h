@@ -11,12 +11,13 @@
 #include <sys/socket.h>
 
 #ifdef __cplusplus
-extern "C"{
+extern "C" {
 #endif
 
 #define evutil_socket_t int
 #define EV_READ HV_READ
 #define EV_WRITE HV_WRITE
+#define EV_SIGNAL 0x08
 #define EV_PERSIST 0x0010
 #define EV_TIMEOUT 0x0020
 #define evutil_make_socket_nonblocking(s) nonblocking((s))
@@ -56,9 +57,7 @@ extern "C"{
 #define MAX_TO_REALIGN_IN_EXPAND 2048
 #define evutil_socket_error_to_string(errcode) (strerror(errcode))
 #define BEV_OPT_CLOSE_ON_FREE (1 << 0)
-#define BEV_OPT_THREADSAFE (1 << 1)
 #define BEV_OPT_DEFER_CALLBACKS (1 << 2)
-#define BEV_OPT_UNLOCK_CALLBACKS (1 << 3)
 #define EVBUFFER_MAX_READ 4096
 #define EVBUFFER_REFERENCE 0x0004
 #define EVBUFFER_IMMUTABLE 0x0008
@@ -66,7 +65,6 @@ extern "C"{
 #define LEV_OPT_CLOSE_ON_FREE (1u << 1)
 #define LEV_OPT_CLOSE_ON_EXEC (1u << 2)
 #define LEV_OPT_REUSEABLE (1u << 3)
-#define LEV_OPT_THREADSAFE (1u << 4)
 #define LEV_OPT_DISABLED (1u << 5)
 #define LEV_OPT_DEFERRED_ACCEPT (1u << 6)
 #define LEV_OPT_REUSEABLE_PORT (1u << 7)
@@ -88,6 +86,11 @@ typedef void (*bufferevent_data_cb)(struct bufferevent *bev, void *ctx);
 typedef void (*bufferevent_event_cb)(struct bufferevent *bev, short what,
                                      void *ctx);
 
+struct queue_node {
+  struct queue_node *pre;
+  struct queue_node *next;
+};
+
 struct event {
   struct event_base *base;
 
@@ -101,12 +104,22 @@ struct event {
 
   htimer_t *timer;
   int timeout;
+
+  int num_calls;
+  struct queue_node self_signal_node;
+  struct queue_node self_awaken_signal_node;
 };
 
 struct event_base {
   hloop_t *loop;
   htimer_t *timer;
   int timeout;
+
+  int enable_signal;
+  struct event signal_monitor;
+  int pair[2];
+  struct queue_node signal_events_head[NSIG];
+  struct queue_node awaken_signal_events_head;
 };
 
 struct evbuffer_chain {
