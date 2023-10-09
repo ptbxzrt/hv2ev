@@ -1585,3 +1585,8 @@ ev_token_bucket_cfg_new(size_t read_rate, size_t read_burst, size_t write_rate,
       (tick_len->tv_usec & COMMON_TIMEOUT_MICROSECONDS_MASK) / 1000;
   return r;
 }
+
+int event_base_gettimeofday_cached(struct event_base *base,
+                                   struct timeval *tv) {
+  gettimeofday(tv, NULL);
+}

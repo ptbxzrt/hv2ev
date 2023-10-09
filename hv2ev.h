@@ -330,13 +330,14 @@ struct ev_token_bucket_cfg *
 ev_token_bucket_cfg_new(size_t read_rate, size_t read_burst, size_t write_rate,
                         size_t write_burst, const struct timeval *tick_len);
 
-// TODO_Lists
 #define evsignal_new(b, x, cb, arg)                                            \
   event_new((b), (x), EV_SIGNAL | EV_PERSIST, (cb), (arg))
 #define evsignal_add(ev, tv) event_add((ev), (tv))
+int event_base_gettimeofday_cached(struct event_base *base, struct timeval *tv);
+
+// TODO_Lists
 int bufferevent_set_rate_limit(struct bufferevent *bev,
                                struct ev_token_bucket_cfg *cfg);
-int event_base_gettimeofday_cached(struct event_base *base, struct timeval *tv);
 
 #ifdef __cplusplus
 }
