@@ -1122,6 +1122,7 @@ void run_signal_cb(hevent_t *hevent) {
       }
       struct queue_node *next = ev_node->next;
       queue_node_remove(ev_node);
+      queue_node_reset(ev_node);
       ev_node = next;
     }
   }
@@ -1588,5 +1589,10 @@ ev_token_bucket_cfg_new(size_t read_rate, size_t read_burst, size_t write_rate,
 
 int event_base_gettimeofday_cached(struct event_base *base,
                                    struct timeval *tv) {
-  gettimeofday(tv, NULL);
+  return gettimeofday(tv, NULL);
+}
+
+int bufferevent_set_rate_limit(struct bufferevent *bev,
+                               struct ev_token_bucket_cfg *cfg) {
+  return 0;
 }
